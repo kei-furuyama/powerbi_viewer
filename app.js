@@ -792,6 +792,8 @@
       accentWidth: readExprNumber(accentProps?.width),
       valueColor: readExprColor(valueProps?.fontColor),
       labelColor: readExprColor(labelProps?.fontColor),
+      valueSize: parseFontSize(readExpr(valueProps?.fontSize)),
+      labelSize: parseFontSize(readExpr(labelProps?.fontSize)),
     };
   }
 
@@ -2453,8 +2455,16 @@
       const valueText = data?.kind === "card" ? data.text : "—";
       const label = (data?.kind === "card" && data.label) || valueLabel;
       const card = visual.style?.card || {};
-      const valueStyle = card.valueColor ? `color:${escapeAttribute(card.valueColor)}` : "";
-      const labelStyle = card.labelColor ? `color:${escapeAttribute(card.labelColor)}` : "";
+      // 実フォントサイズ(pt)をキャンバス高さ基準(cqh)へ変換してズームに追従
+      const toCqh = (pt) => `${(((pt * 96) / 72 / Math.max(1, pageHeight)) * 100).toFixed(2)}cqh`;
+      const valueStyle = [
+        card.valueColor ? `color:${card.valueColor}` : "",
+        card.valueSize ? `font-size:${toCqh(card.valueSize)}` : "",
+      ].filter(Boolean).join(";");
+      const labelStyle = [
+        card.labelColor ? `color:${card.labelColor}` : "",
+        card.labelSize ? `font-size:${toCqh(card.labelSize)}` : "",
+      ].filter(Boolean).join(";");
       return `
         <div class="mini-card">
           <div class="mini-card-value" style="${valueStyle}">${escapeHtml(valueText)}</div>
