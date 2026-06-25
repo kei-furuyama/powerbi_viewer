@@ -306,10 +306,11 @@
       });
     }
 
+    const fieldBindingCount = report.visuals.reduce((sum, visual) => sum + visual.roles.length, 0);
     issues.push({
       level: "info",
-      title: "実データは描画しません",
-      detail: "PBIPには通常データ本体が含まれません。このビューアはPBIR/TMDLメタデータを元にレイアウトと定義を表示します。",
+      title: "メタデータからレイアウトを再現しました",
+      detail: `${report.visuals.length}ビジュアル / ${fieldBindingCount}ロールのデータバインド、書式・テーマを反映しています(実データ値は含みません)。`,
     });
 
     return {
@@ -343,6 +344,7 @@
     report.reportJson = firstJsonEnding(jsonByPath, "/definition/report.json") || firstJsonEnding(jsonByPath, "/report.json");
     report.pagesJson = firstJsonEnding(jsonByPath, "/definition/pages/pages.json");
     report.meta = extractReportMeta(report.definitionPbir, report.reportJson);
+    report.theme = extractTheme(entries, jsonByPath, report.reportJson);
 
     const pageEntries = entries.filter((entry) => {
       const lower = entry.path.toLowerCase();
@@ -380,6 +382,7 @@
         type: pageJson.type || pageJson.pageType || "ReportPage",
         visibility: pageJson.visibility || "Visible",
         ordinal: Number.isFinite(Number(pageJson.ordinal)) ? Number(pageJson.ordinal) : null,
+        background: extractPageBackground(pageJson),
         visuals,
         json: pageJson,
       });
@@ -430,6 +433,56 @@
     }
 
     return meta;
+  }
+
+  const DEFAULT_THEME_COLORS = [
+    "#118DFF", "#12239E", "#E66C37", "#6B007B", "#E044A7",
+    "#744EC2", "#D9B300", "#D64550", "#197278", "#1AAB40",
+  ];
+
+  function extractTheme(entries, jsonByPath, reportJson) {
+    const palettes = [];
+
+    const collectFrom = (themeJson) => {
+      const colors = readThemeColors(themeJson);
+      if (colors.length) palettes.push(colors);
+    };
+
+    // report.json に埋め込まれたカスタムテーマ
+    collectFrom(reportJson?.themeCollection?.customTheme);
+    collectFrom(reportJson?.themeCollection?.baseTheme);
+
+    // テーマJSONファイル(RegisteredResources / StaticResources / *Theme*.json)
+    for (const [path, json] of jsonByPath.entries()) {
+      const lower = path.toLowerCase();
+      if (!lower.endsWith(".json")) continue;
+      if (lower.includes("theme") || lower.includes("/staticresources/") || lower.includes("/registeredresources/")) {
+        collectFrom(json);
+      }
+    }
+
+    const dataColors = palettes.find((colors) => colors.length) || DEFAULT_THEME_COLORS;
+    return { dataColors, isDefault: dataColors === DEFAULT_THEME_COLORS };
+  }
+
+  function readThemeColors(themeJson) {
+    if (!themeJson || typeof themeJson !== "object") return [];
+    const candidates = themeJson.dataColors || themeJson.dataColours || themeJson.palette?.dataColors;
+    if (Array.isArray(candidates)) {
+      return candidates.map((color) => normalizeColor(color)).filter(Boolean);
+    }
+    return [];
+  }
+
+  function extractPageBackground(pageJson) {
+    const objects = pageJson?.objects || pageJson?.config?.objects || {};
+    const bgProps = firstObjectProps(objects.background);
+    const outProps = firstObjectProps(objects.outspace) || firstObjectProps(objects.outspacePane);
+    return {
+      color: readExprColor(bgProps?.color),
+      transparency: readExprNumber(bgProps?.transparency),
+      outspaceColor: readExprColor(outProps?.color),
+    };
   }
 
   function extractLegacyPage(section, reportPath, index) {
@@ -518,22 +571,272 @@
       pageDimensions,
       index,
     );
+    const aliasMap = buildSourceAliasMap(visualRoot);
+    const roles = extractRoles(visualObject, visualRoot, aliasMap);
     const fields = extractFields(visualRoot);
-    const title = extractTitle(visualRoot) || extractTextContent(visualRoot) || typeLabel(type);
+    const style = extractVisualStyle(visualObject, visualRoot);
+    const textContent = extractRichText(visualObject, visualRoot);
+    const explicitTitle = style.title.text || extractTitle(visualRoot);
+    const title = explicitTitle || textContent || typeLabel(type);
 
     return {
       id: String(visualRoot.name || fallbackId),
       pageId,
       path: entry.path,
       title,
+      hasExplicitTitle: Boolean(explicitTitle) && style.title.show !== false,
       type,
       typeLabel: typeLabel(type),
       position,
+      roles,
       fields,
+      style,
+      textContent,
       filterCount: countKeyMatches(visualRoot, /filter/i),
       hasQuery: Boolean(visualObject.query || visualRoot.query || visualObject.prototypeQuery),
       jsonStatus: json ? "parsed" : "missing",
     };
+  }
+
+  // --- ロール別データバインド解析 ---------------------------------------
+
+  const VALUE_ROLE_NAMES = new Set([
+    "y", "y2", "values", "value", "data", "size", "gauge", "weight",
+    "target", "min", "max", "x", "playaxis", "saturation",
+  ]);
+
+  function classifyRole(roleName, fieldKind) {
+    const lower = String(roleName || "").toLowerCase();
+    if (fieldKind === "measure" || fieldKind === "aggregation") return "value";
+    if (VALUE_ROLE_NAMES.has(lower)) return "value";
+    return "category";
+  }
+
+  function extractRoles(visualObject, visualRoot, aliasMap) {
+    const roles = [];
+
+    const queryState = visualObject?.query?.queryState || visualRoot?.query?.queryState;
+    if (queryState && typeof queryState === "object") {
+      for (const [roleName, def] of Object.entries(queryState)) {
+        const projections = Array.isArray(def?.projections) ? def.projections : [];
+        const fields = projections
+          .map((projection) => projectionToField(projection, aliasMap))
+          .filter(Boolean);
+        if (fields.length) roles.push({ role: roleName, fields });
+      }
+    }
+
+    if (!roles.length) {
+      const proto = visualObject?.prototypeQuery || visualRoot?.prototypeQuery;
+      const transforms = visualObject?.dataTransforms || visualRoot?.dataTransforms;
+      if (proto && Array.isArray(proto.Select)) {
+        const protoAlias = buildSourceAliasMap(proto);
+        const byRole = new Map();
+        proto.Select.forEach((select, selectIndex) => {
+          const field = projectionToField({ field: select, nativeQueryRef: select?.Name }, protoAlias);
+          if (!field) return;
+          const roleName = legacySelectRole(transforms, selectIndex) || (field.kind === "measure" ? "Values" : "Category");
+          if (!byRole.has(roleName)) byRole.set(roleName, []);
+          byRole.get(roleName).push(field);
+        });
+        for (const [role, fields] of byRole.entries()) roles.push({ role, fields });
+      }
+    }
+
+    return roles;
+  }
+
+  function legacySelectRole(transforms, selectIndex) {
+    const selects = transforms?.selects;
+    if (!Array.isArray(selects)) return null;
+    const entry = selects[selectIndex];
+    const roleObj = entry?.roles;
+    if (roleObj && typeof roleObj === "object") {
+      const active = Object.keys(roleObj).find((key) => roleObj[key]);
+      if (active) return active;
+    }
+    return null;
+  }
+
+  const AGG_FUNCTIONS = { 0: "Sum", 1: "Avg", 2: "Count", 3: "Min", 4: "Max", 5: "CountNonNull", 6: "Median", 7: "StdDev", 8: "Var" };
+
+  function projectionToField(projection, aliasMap) {
+    if (!projection || typeof projection !== "object") return null;
+    const field = projection.field || projection;
+
+    let kind = "column";
+    let inner = null;
+    let agg = null;
+    if (field.Measure) { kind = "measure"; inner = field.Measure; }
+    else if (field.Aggregation) {
+      kind = "aggregation";
+      inner = field.Aggregation.Expression?.Column || field.Aggregation.Expression || field.Aggregation;
+      agg = AGG_FUNCTIONS[field.Aggregation.Function] || "Sum";
+    }
+    else if (field.Column) { kind = "column"; inner = field.Column; }
+    else if (field.HierarchyLevel) { kind = "hierarchy"; inner = field.HierarchyLevel; }
+    else if (field.Hierarchy) { kind = "hierarchy"; inner = field.Hierarchy; }
+    else { inner = field; }
+
+    let table = "";
+    let name = "";
+    if (inner) {
+      const resolved = fieldFromExpression(inner, aliasMap);
+      table = cleanFieldName(resolved.table || "");
+      name = cleanFieldName(resolved.name || "");
+    }
+
+    if (!name && projection.nativeQueryRef) name = cleanFieldName(projection.nativeQueryRef);
+    if (projection.queryRef && (!table || !name)) {
+      const parts = String(projection.queryRef).split(".");
+      if (parts.length >= 2) {
+        table = table || cleanFieldName(parts[0]);
+        name = name || cleanFieldName(parts.slice(1).join("."));
+      }
+    }
+    if (!name) return null;
+
+    const label = table ? `${table}[${name}]` : name;
+    return {
+      kind,
+      table,
+      name,
+      label,
+      agg,
+      display: cleanFieldName(projection.displayName || projection.nativeQueryRef || name),
+      queryRef: projection.queryRef || "",
+    };
+  }
+
+  // --- 書式・リッチテキスト解析 ----------------------------------------
+
+  function extractVisualStyle(visualObject, visualRoot) {
+    const containerObjects =
+      visualObject?.visualContainerObjects || visualRoot?.visualContainerObjects || visualObject?.vcObjects || {};
+    const objects = visualObject?.objects || visualRoot?.objects || visualRoot?.config?.objects || {};
+
+    const titleProps = firstObjectProps(containerObjects.title) || firstObjectProps(objects.title);
+    const titleText = readExprString(titleProps?.text);
+    const titleShow = readExprBool(titleProps?.show);
+
+    const bgProps = firstObjectProps(containerObjects.background) || firstObjectProps(objects.background);
+    const borderProps = firstObjectProps(containerObjects.border) || firstObjectProps(objects.border);
+    const fillProps = firstObjectProps(objects.fill);
+
+    return {
+      fill: readExprColor(fillProps?.fillColor) || readExprColor(fillProps?.color),
+      title: {
+        text: isDisplayText(titleText) ? titleText : "",
+        color: readExprColor(titleProps?.fontColor),
+        align: readExprString(titleProps?.alignment) || readExprString(titleProps?.titleAlignment) || "",
+        show: titleShow !== false,
+      },
+      background: {
+        color: readExprColor(bgProps?.color),
+        show: readExprBool(bgProps?.show) !== false,
+        transparency: readExprNumber(bgProps?.transparency),
+      },
+      border: {
+        color: readExprColor(borderProps?.color),
+        show: readExprBool(borderProps?.show) === true,
+        radius: readExprNumber(borderProps?.radius),
+      },
+      dataColors: extractDataColors(objects),
+    };
+  }
+
+  function extractDataColors(objects) {
+    const colors = [];
+    const dataPoint = objects?.dataPoint;
+    if (Array.isArray(dataPoint)) {
+      for (const item of dataPoint) {
+        const color = readExprColor(item?.properties?.fill);
+        if (color) colors.push(color);
+      }
+    }
+    return colors;
+  }
+
+  function firstObjectProps(value) {
+    if (Array.isArray(value)) return value[0]?.properties || value[0] || null;
+    if (value && typeof value === "object") return value.properties || value;
+    return null;
+  }
+
+  function readExpr(prop) {
+    if (prop == null) return undefined;
+    if (typeof prop !== "object") return prop;
+    const expr = prop.expr || prop.Expr || prop;
+    if (expr && typeof expr === "object") {
+      if (expr.Literal && "Value" in expr.Literal) return expr.Literal.Value;
+      if ("Value" in expr) return expr.Value;
+    }
+    return undefined;
+  }
+
+  function readExprString(prop) {
+    const value = readExpr(prop);
+    return value == null ? "" : cleanLiteral(String(value));
+  }
+
+  function readExprBool(prop) {
+    const value = readExpr(prop);
+    if (value == null) return undefined;
+    if (typeof value === "boolean") return value;
+    return /^true$/i.test(String(value).replace(/'/g, ""));
+  }
+
+  function readExprNumber(prop) {
+    const value = readExpr(prop);
+    const number = Number(String(value ?? "").replace(/['D]/g, ""));
+    return Number.isFinite(number) ? number : undefined;
+  }
+
+  function readExprColor(prop) {
+    if (prop == null) return "";
+    if (typeof prop === "string") return normalizeColor(prop);
+    const direct = readExpr(prop);
+    if (typeof direct === "string" && direct) return normalizeColor(direct);
+    // solid color expressions: { solid: { color: { expr: { Literal: { Value: "'#RRGGBB'" } } } } }
+    const solid = prop.solid || prop.Solid;
+    if (solid) {
+      const colorValue = readExpr(solid.color || solid.Color);
+      if (typeof colorValue === "string" && colorValue) return normalizeColor(colorValue);
+    }
+    let found = "";
+    walk(prop, (node) => {
+      if (found) return;
+      if (typeof node === "string" && /^'?#[0-9a-f]{3,8}'?$/i.test(node.trim())) {
+        found = normalizeColor(node);
+      }
+    });
+    return found;
+  }
+
+  function normalizeColor(value) {
+    const text = cleanLiteral(String(value || "")).trim();
+    return /^#[0-9a-f]{3,8}$/i.test(text) ? text : "";
+  }
+
+  function extractRichText(visualObject, visualRoot) {
+    // 新PBIR textbox: visual.objects.general[].properties.paragraphs
+    const objects = visualObject?.objects || visualRoot?.objects || {};
+    const paragraphHosts = [objects.general, objects.text, objects.textBox];
+    for (const host of paragraphHosts) {
+      const props = firstObjectProps(host);
+      const text = paragraphsToText(props?.paragraphs);
+      if (text) return text.slice(0, 240);
+    }
+    return extractTextContent(visualRoot);
+  }
+
+  function paragraphsToText(paragraphs) {
+    if (!Array.isArray(paragraphs)) return "";
+    return paragraphs
+      .flatMap((paragraph) => paragraph?.textRuns || [])
+      .map((run) => run?.value ?? readExpr(run?.value) ?? "")
+      .join("")
+      .trim();
   }
 
   function normalizePosition(rawPosition, pageDimensions, index) {
@@ -1019,8 +1322,12 @@
 
     els.canvasMeta.textContent = `${Math.round(page.width)} x ${Math.round(page.height)} / ${page.visuals.length} visuals`;
     els.reportCanvas.style.aspectRatio = `${page.width} / ${page.height}`;
+    els.reportCanvas.style.background = page.background?.color || "";
+
+    const theme = getTheme();
 
     for (const visual of page.visuals) {
+      const style = visual.style || {};
       const box = document.createElement("button");
       box.type = "button";
       box.className = `visual-box ${visual.id === state.selectedVisualId ? "selected" : ""}`;
@@ -1029,10 +1336,23 @@
       box.style.width = `${percent(visual.position.width, page.width)}%`;
       box.style.height = `${percent(visual.position.height, page.height)}%`;
       box.style.zIndex = String(Math.max(1, Math.round(visual.position.z || 0) + 1));
+
+      const boxBackground =
+        style.background?.color || (visual.type.toLowerCase().includes("shape") ? style.fill : "");
+      if (boxBackground) box.style.background = boxBackground;
+      if (style.border?.show && style.border.color) box.style.borderColor = style.border.color;
+      if (Number.isFinite(style.border?.radius)) box.style.borderRadius = `${style.border.radius}px`;
+
+      const showTitle = visual.hasExplicitTitle;
+      const titleStyle = [
+        style.title?.color ? `color:${style.title.color}` : "",
+        style.title?.align ? `text-align:${cssAlign(style.title.align)}` : "",
+      ].filter(Boolean).join(";");
+
       box.title = `${visual.typeLabel} / ${visual.fields.length} fields`;
       box.innerHTML = `
-        <div class="visual-title">${escapeHtml(visual.title)}</div>
-        <div class="visual-body">${renderVisualPreview(visual)}</div>
+        ${showTitle ? `<div class="visual-title" style="${titleStyle}">${escapeHtml(visual.title)}</div>` : ""}
+        <div class="visual-body">${renderVisualPreview(visual, theme)}</div>
       `;
       box.addEventListener("click", () => {
         state.selectedVisualId = visual.id;
@@ -1044,15 +1364,54 @@
     renderInspector(page);
   }
 
-  function renderVisualPreview(visual) {
-    const type = visual.type.toLowerCase();
-    const firstField = visual.fields[0]?.name || visual.typeLabel;
+  function getTheme() {
+    return state.project?.report?.theme?.dataColors || DEFAULT_THEME_COLORS;
+  }
 
-    if (type.includes("card") || type.includes("kpi")) {
+  function cssAlign(align) {
+    const value = String(align).toLowerCase();
+    if (value.includes("right")) return "right";
+    if (value.includes("center")) return "center";
+    return "left";
+  }
+
+  function roleFieldsOf(visual, kind) {
+    const result = [];
+    for (const role of visual.roles || []) {
+      for (const field of role.fields) {
+        if (classifyRole(role.role, field.kind) === kind) result.push(field);
+      }
+    }
+    return result;
+  }
+
+  function renderVisualPreview(visual, theme = DEFAULT_THEME_COLORS) {
+    const type = visual.type.toLowerCase();
+    const categories = roleFieldsOf(visual, "category");
+    const values = roleFieldsOf(visual, "value");
+    const valueLabel = values[0]?.display || visual.fields.find((field) => field.kind !== "column")?.name || visual.typeLabel;
+    const categoryLabel = categories[0]?.display || visual.fields[0]?.name || "";
+    const color = theme[0] || "#118DFF";
+
+    if (type.includes("textbox") || type.includes("text")) {
+      const text = visual.textContent || visual.title || "";
+      return `<div class="mini-text">${escapeHtml(text)}</div>`;
+    }
+
+    if (type.includes("image")) {
+      return `<div class="mini-image" aria-hidden="true"></div>`;
+    }
+
+    if (type.includes("shape")) {
+      // 塗り色はビジュアルボックス自体に適用済み。未指定時のみプレースホルダを描画。
+      return visual.style?.fill ? "" : `<div class="mini-shape" aria-hidden="true"></div>`;
+    }
+
+    if (type.includes("card") || type.includes("kpi") || type.includes("gauge") || type.includes("multirowcard")) {
       return `
         <div>
-          <div class="mini-card-value">--</div>
-          <div class="mini-card-label">${escapeHtml(firstField)}</div>
+          <div class="mini-card-value">—</div>
+          <div class="mini-card-label">${escapeHtml(valueLabel)}</div>
         </div>
       `;
     }
@@ -1061,41 +1420,61 @@
       return `
         <svg class="mini-line" viewBox="0 0 120 64" preserveAspectRatio="none" aria-hidden="true">
           <path d="M5 58H116" stroke="#ded8ca" stroke-width="1" />
-          <path d="M5 52L28 35L48 42L74 18L96 27L116 10" fill="none" stroke="#007c72" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" />
+          <path d="M5 52L28 35L48 42L74 18L96 27L116 10" fill="none" stroke="${escapeAttribute(color)}" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" />
         </svg>
+        ${miniAxis(categoryLabel, valueLabel)}
       `;
     }
 
-    if (type.includes("bar") || type.includes("column")) {
+    if (type.includes("pie") || type.includes("donut")) {
+      const stops = pieGradient(theme);
+      const inner = type.includes("donut") ? `<span class="mini-pie-hole"></span>` : "";
+      return `<div class="mini-pie" style="background:conic-gradient(${stops})" aria-hidden="true">${inner}</div>`;
+    }
+
+    if (type.includes("bar") || type.includes("column") || type.includes("histogram") || type.includes("funnel") || type.includes("waterfall")) {
+      const heights = [42, 70, 54, 86, 62];
+      const bars = heights
+        .map((height, index) => `<span style="height:${height}%;background:${escapeAttribute(theme[index % theme.length])}"></span>`)
+        .join("");
       return `
-        <div class="mini-bars" aria-hidden="true">
-          <span style="height: 42%"></span>
-          <span style="height: 70%; background: var(--amber)"></span>
-          <span style="height: 54%; background: var(--rose)"></span>
-          <span style="height: 86%"></span>
-          <span style="height: 62%; background: var(--violet)"></span>
-        </div>
+        <div class="mini-bars" aria-hidden="true">${bars}</div>
+        ${miniAxis(categoryLabel, valueLabel)}
       `;
     }
 
     if (type.includes("map")) {
       return `
         <div class="mini-map" aria-hidden="true">
-          <span style="left: 22%; top: 38%"></span>
-          <span style="left: 62%; top: 28%; width: 20px; height: 20px"></span>
-          <span style="left: 48%; top: 62%; background: rgba(0, 124, 114, 0.74)"></span>
+          <span style="left: 22%; top: 38%; background:${escapeAttribute(theme[0])}"></span>
+          <span style="left: 62%; top: 28%; width: 20px; height: 20px; background:${escapeAttribute(theme[1] || theme[0])}"></span>
+          <span style="left: 48%; top: 62%; background:${escapeAttribute(theme[2] || theme[0])}"></span>
         </div>
       `;
     }
 
     if (type.includes("slicer")) {
+      const options = categories.length
+        ? categories.slice(0, 1).map((field) => field.display)
+        : [categoryLabel];
       return `
         <div class="mini-slicer">
-          <span><i></i>${escapeHtml(firstField)}</span>
-          <span><i></i>Option</span>
-          <span><i></i>Option</span>
+          <span class="mini-slicer-head">${escapeHtml(categoryLabel || "Slicer")}</span>
+          ${["項目 1", "項目 2", "項目 3"].map((item) => `<span><i></i>${escapeHtml(item)}</span>`).join("")}
         </div>
       `;
+    }
+
+    // テーブル / マトリックス
+    if (type.includes("table") || type.includes("pivot") || type.includes("matrix")) {
+      const columns = [...categories, ...values];
+      if (columns.length) {
+        const head = columns.slice(0, 4).map((field) => `<th>${escapeHtml(field.display)}</th>`).join("");
+        const body = Array.from({ length: 4 }, () =>
+          `<tr>${columns.slice(0, 4).map(() => "<td>—</td>").join("")}</tr>`,
+        ).join("");
+        return `<table class="mini-grid"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
+      }
     }
 
     return `
@@ -1103,6 +1482,23 @@
         ${Array.from({ length: 15 }, (_, index) => `<span style="${index < 3 ? "background:#c9c1b2" : ""}"></span>`).join("")}
       </div>
     `;
+  }
+
+  function miniAxis(categoryLabel, valueLabel) {
+    if (!categoryLabel && !valueLabel) return "";
+    return `<div class="mini-axis"><span>${escapeHtml(valueLabel || "")}</span><span>${escapeHtml(categoryLabel || "")}</span></div>`;
+  }
+
+  function pieGradient(theme) {
+    const slices = [38, 27, 18, 17];
+    let acc = 0;
+    return slices
+      .map((slice, index) => {
+        const start = acc;
+        acc += slice;
+        return `${theme[index % theme.length]} ${start}% ${acc}%`;
+      })
+      .join(", ");
   }
 
   function renderInspector(page) {
@@ -1114,12 +1510,36 @@
       return;
     }
 
-    const fields = visual.fields.length
-      ? visual.fields
-          .slice(0, 24)
-          .map((field) => `<span class="chip">${escapeHtml(field.kind)}: ${escapeHtml(field.label)}</span>`)
+    const roleBlocks = visual.roles?.length
+      ? visual.roles
+          .map(
+            (role) => `
+              <div class="role-row">
+                <span class="role-name">${escapeHtml(role.role)}</span>
+                <div class="chips">
+                  ${role.fields
+                    .map((field) => `<span class="chip ${escapeAttribute(field.kind)}">${escapeHtml(field.label)}</span>`)
+                    .join("")}
+                </div>
+              </div>
+            `,
+          )
           .join("")
-      : `<span class="muted">フィールド参照なし</span>`;
+      : visual.fields.length
+        ? `<div class="chips">${visual.fields
+            .slice(0, 24)
+            .map((field) => `<span class="chip">${escapeHtml(field.kind)}: ${escapeHtml(field.label)}</span>`)
+            .join("")}</div>`
+        : `<span class="muted">フィールド参照なし</span>`;
+
+    const style = visual.style || {};
+    const styleChips = [
+      style.title?.text ? `タイトル: ${style.title.text}` : "",
+      style.title?.color ? `タイトル色: ${style.title.color}` : "",
+      style.background?.color ? `背景: ${style.background.color}` : "",
+      style.border?.show ? `枠線: ${style.border.color || "あり"}` : "",
+      style.dataColors?.length ? `データ色: ${style.dataColors.length}件` : "",
+    ].filter(Boolean);
 
     els.visualInspector.innerHTML = `
       <div class="inspector-grid">
@@ -1131,8 +1551,9 @@
           <div><dt>フィルタ</dt><dd>${visual.filterCount}</dd></div>
         </dl>
         <div>
-          <div class="panel-title">フィールド参照</div>
-          <div class="chips">${fields}</div>
+          <div class="panel-title">データバインド(ロール別)</div>
+          <div class="role-list">${roleBlocks}</div>
+          ${styleChips.length ? `<div class="panel-title">書式</div><div class="chips">${styleChips.map((text) => `<span class="chip subtle">${escapeHtml(text)}</span>`).join("")}</div>` : ""}
         </div>
       </div>
     `;
@@ -1295,17 +1716,22 @@
       })),
       report: {
         root: state.project.report.root,
+        theme: state.project.report.theme,
         pages: state.project.report.pages.map((page) => ({
           id: page.id,
           displayName: page.displayName,
           width: page.width,
           height: page.height,
+          background: page.background,
           visuals: page.visuals.map((visual) => ({
             id: visual.id,
             title: visual.title,
             type: visual.type,
             position: visual.position,
+            roles: visual.roles,
             fields: visual.fields,
+            style: visual.style,
+            textContent: visual.textContent,
             path: visual.path,
           })),
         })),

@@ -109,7 +109,107 @@ assert.equal(project.semantic.tables.length, 1);
 assert.equal(project.semantic.tables[0].columns.length, 2);
 assert.equal(project.semantic.tables[0].measures.length, 1);
 
+// --- ロール別データバインドの再現 ---
+const roles = project.report.visuals[0].roles;
+assert.ok(Array.isArray(roles) && roles.length >= 2, "roles should be extracted");
+const categoryRole = roles.find((role) => role.role === "Category");
+const valueRole = roles.find((role) => role.role === "Y");
+assert.ok(categoryRole?.fields.some((field) => field.label === "Sales[Region]"));
+assert.ok(valueRole?.fields.some((field) => field.label === "Sales[Total Sales]" && field.kind === "measure"));
+
+// --- テーマ配色の再現(デフォルトパレットへフォールバック) ---
+assert.ok(Array.isArray(project.report.theme.dataColors) && project.report.theme.dataColors.length > 0);
+
 console.log("parser smoke test passed");
+
+// --- 書式(タイトル文言・背景色)とテーマファイルの解析 ---
+const styledProject = analyzeProject(
+  [
+    { path: "Styled.pbip", text: JSON.stringify({ version: "1.0", artifacts: [{ report: { path: "Styled.Report" } }] }), size: 80 },
+    {
+      path: "Styled.Report/definition/pages/pages.json",
+      text: JSON.stringify({ pageOrder: ["P1"] }),
+      size: 40,
+    },
+    {
+      path: "Styled.Report/definition/pages/P1/page.json",
+      text: JSON.stringify({ name: "P1", displayName: "Styled", width: 1280, height: 720 }),
+      size: 80,
+    },
+    {
+      path: "Styled.Report/definition/pages/P1/visuals/V1/visual.json",
+      text: JSON.stringify({
+        name: "V1",
+        position: { x: 0, y: 0, width: 200, height: 120, z: 0 },
+        visual: {
+          visualType: "card",
+          visualContainerObjects: {
+            title: [{ properties: { text: { expr: { Literal: { Value: "'売上合計'" } } }, fontColor: { solid: { color: { expr: { Literal: { Value: "'#FF0000'" } } } } } } }],
+            background: [{ properties: { color: { solid: { color: { expr: { Literal: { Value: "'#00FF00'" } } } } } } }],
+          },
+        },
+      }),
+      size: 200,
+    },
+    {
+      path: "Styled.Report/StaticResources/SharedResources/BaseThemes/CustomTheme.json",
+      text: JSON.stringify({ name: "Custom", dataColors: ["#010203", "#040506"] }),
+      size: 80,
+    },
+  ],
+  [],
+);
+
+const styledVisual = styledProject.report.visuals[0];
+assert.equal(styledVisual.title, "売上合計");
+assert.equal(styledVisual.style.title.color, "#FF0000");
+assert.equal(styledVisual.style.background.color, "#00FF00");
+assert.deepEqual(styledProject.report.theme.dataColors, ["#010203", "#040506"]);
+assert.equal(styledProject.report.theme.isDefault, false);
+
+assert.equal(styledVisual.hasExplicitTitle, true, "explicit title object should show title");
+
+console.log("style & theme smoke test passed");
+
+// --- 実プロジェクト型の挙動(タイトル抑制 / shape塗り / displayName) ---
+const fidelityProject = analyzeProject(
+  [
+    { path: "F.pbip", text: JSON.stringify({ version: "1.0", artifacts: [{ report: { path: "F.Report" } }] }), size: 40 },
+    { path: "F.Report/definition/pages/pages.json", text: JSON.stringify({ pageOrder: ["P"] }), size: 30 },
+    { path: "F.Report/definition/pages/P/page.json", text: JSON.stringify({ name: "P", displayName: "P", width: 1920, height: 1080 }), size: 60 },
+    {
+      path: "F.Report/definition/pages/P/visuals/header/visual.json",
+      text: JSON.stringify({
+        name: "header",
+        position: { x: 0, y: 0, width: 1920, height: 84, z: 0 },
+        visual: { visualType: "shape", objects: { fill: [{ properties: { fillColor: { solid: { color: { expr: { Literal: { Value: "'#1F5FA6'" } } } } } } }] } },
+      }),
+      size: 120,
+    },
+    {
+      path: "F.Report/definition/pages/P/visuals/kpi/visual.json",
+      text: JSON.stringify({
+        name: "kpi",
+        position: { x: 40, y: 110, width: 430, height: 120, z: 1 },
+        visual: {
+          visualType: "cardVisual",
+          query: { queryState: { Data: { projections: [{ field: { Measure: { Expression: { SourceRef: { Entity: "案件" } }, Property: "件数" } }, queryRef: "案件.件数", nativeQueryRef: "件数", displayName: "指摘金額の合計(7案件)" }] } } },
+        },
+      }),
+      size: 200,
+    },
+  ],
+  [],
+);
+
+const header = fidelityProject.report.pages[0].visuals.find((visual) => visual.id === "header");
+const kpi = fidelityProject.report.pages[0].visuals.find((visual) => visual.id === "kpi");
+assert.equal(header.style.fill, "#1F5FA6", "shape fill color");
+assert.equal(header.hasExplicitTitle, false, "shape has no auto title bar");
+assert.equal(kpi.hasExplicitTitle, false, "card has no auto title bar");
+assert.equal(kpi.roles.flatMap((role) => role.fields)[0].display, "指摘金額の合計(7案件)", "card label uses displayName");
+
+console.log("fidelity smoke test passed");
 
 const legacyReportConfig = {
   name: "legacy_donut",
