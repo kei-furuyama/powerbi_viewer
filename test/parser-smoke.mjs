@@ -211,6 +211,88 @@ assert.equal(kpi.roles.flatMap((role) => role.fields)[0].display, "指摘金額�
 
 console.log("fidelity smoke test passed");
 
+// --- TMDLインラインデータからの測定値評価 ---
+const dataProject = analyzeProject(
+  [
+    { path: "D.pbip", text: JSON.stringify({ version: "1.0", artifacts: [{ report: { path: "D.Report" } }] }), size: 40 },
+    { path: "D.Report/definition/pages/pages.json", text: JSON.stringify({ pageOrder: ["P"] }), size: 30 },
+    { path: "D.Report/definition/pages/P/page.json", text: JSON.stringify({ name: "P", displayName: "P", width: 1280, height: 720 }), size: 60 },
+    {
+      path: "D.Report/definition/pages/P/visuals/card/visual.json",
+      text: JSON.stringify({
+        name: "card",
+        position: { x: 0, y: 0, width: 200, height: 120, z: 0 },
+        visual: { visualType: "cardVisual", query: { queryState: { Data: { projections: [{ field: { Measure: { Expression: { SourceRef: { Entity: "案件" } }, Property: "指摘金額計" } }, queryRef: "案件.指摘金額計", nativeQueryRef: "指摘金額計" }] } } } },
+      }),
+      size: 120,
+    },
+    {
+      path: "D.Report/definition/pages/P/visuals/bar/visual.json",
+      text: JSON.stringify({
+        name: "bar",
+        position: { x: 0, y: 130, width: 400, height: 240, z: 1 },
+        visual: {
+          visualType: "barChart",
+          query: { queryState: {
+            Category: { projections: [{ field: { Column: { Expression: { SourceRef: { Entity: "案件" } }, Property: "区分" } }, queryRef: "案件.区分", nativeQueryRef: "区分" }] },
+            Y: { projections: [{ field: { Measure: { Expression: { SourceRef: { Entity: "案件" } }, Property: "件数" } }, queryRef: "案件.件数", nativeQueryRef: "件数" }] },
+          } },
+        },
+      }),
+      size: 200,
+    },
+    {
+      path: "D.SemanticModel/definition/tables/案件.tmdl",
+      text: [
+        "table 案件",
+        "\tmeasure 件数 = COUNTROWS('案件')",
+        "\t\tformatString: #,0\"件\"",
+        "\tmeasure 指摘金額計 = CALCULATE(SUM('案件'[金額億円]), '案件'[金額種別] = \"指摘金額\")",
+        "\t\tformatString: #,0.0\"億円\"",
+        "\tcolumn 区分",
+        "\t\tdataType: string",
+        "\tcolumn 金額億円",
+        "\t\tdataType: double",
+        "\tcolumn 金額種別",
+        "\t\tdataType: string",
+        "\tpartition 案件 = m",
+        "\t\tmode: import",
+        "\t\tsource =",
+        "\t\t\tlet",
+        "\t\t\t\tSource = Table.FromRows(",
+        "\t\t\t\t\t{",
+        "\t\t\t\t\t\t{\"A\", 10.5, \"指摘金額\"},",
+        "\t\t\t\t\t\t{\"A\", 5.5, \"指摘金額\"},",
+        "\t\t\t\t\t\t{\"B\", 100, \"背景金額\"}",
+        "\t\t\t\t\t},",
+        "\t\t\t\t\ttype table [区分 = text, 金額億円 = number, 金額種別 = text]",
+        "\t\t\t\t)",
+        "\t\t\tin",
+        "\t\t\t\tSource",
+      ].join("\n"),
+      size: 400,
+    },
+  ],
+  [],
+);
+
+const dataTable = dataProject.semantic.tables.find((table) => table.name === "案件");
+assert.ok(dataTable?.data?.records?.length === 3, "inline data rows parsed");
+assert.equal(dataProject.dataModel.loadedTables[0].rows, 3);
+
+const cardVisual = dataProject.report.pages[0].visuals.find((visual) => visual.id === "card");
+assert.equal(cardVisual.data.kind, "card");
+assert.equal(cardVisual.data.text, "16.0億円", "CALCULATE(SUM) filtered measure evaluated and formatted");
+
+const barVisual = dataProject.report.pages[0].visuals.find((visual) => visual.id === "bar");
+assert.equal(barVisual.data.kind, "category");
+const groupA = barVisual.data.series.find((point) => point.label === "A");
+const groupB = barVisual.data.series.find((point) => point.label === "B");
+assert.equal(groupA.value, 2, "COUNTROWS per category group A");
+assert.equal(groupB.value, 1, "COUNTROWS per category group B");
+
+console.log("inline-data measure smoke test passed");
+
 const legacyReportConfig = {
   name: "legacy_donut",
   layouts: [

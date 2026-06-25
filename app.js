@@ -264,6 +264,8 @@
 
     const report = buildReport(normalizedEntries, jsonByPath);
     const semantic = buildSemantic(normalizedEntries, jsonByPath);
+    const dataModel = buildDataModel(semantic);
+    hydrateVisualData(report, dataModel);
     const pbipFiles = normalizedEntries.filter((entry) => entry.path.toLowerCase().endsWith(".pbip"));
 
     if (!pbipFiles.length) {
@@ -306,12 +308,20 @@
       });
     }
 
-    const fieldBindingCount = report.visuals.reduce((sum, visual) => sum + visual.roles.length, 0);
-    issues.push({
-      level: "info",
-      title: "メタデータからレイアウトを再現しました",
-      detail: `${report.visuals.length}ビジュアル / ${fieldBindingCount}ロールのデータバインド、書式・テーマを反映しています(実データ値は含みません)。`,
-    });
+    if (dataModel.loadedTables.length) {
+      issues.push({
+        level: "info",
+        title: "モデル埋め込みデータから数値を再現しました",
+        detail: `${dataModel.loadedTables.map((table) => `${table.name}: ${table.rows}行`).join(" / ")} を Table.FromRows から読み込み、測定値(DAX)を評価しました。`,
+      });
+    } else {
+      const fieldBindingCount = report.visuals.reduce((sum, visual) => sum + visual.roles.length, 0);
+      issues.push({
+        level: "info",
+        title: "メタデータからレイアウトを再現しました",
+        detail: `${report.visuals.length}ビジュアル / ${fieldBindingCount}ロールのデータバインド、書式・テーマを反映しています(モデルに埋め込みデータが無いため数値は概形表示です)。`,
+      });
+    }
 
     return {
       uploadedAt: new Date().toISOString(),
@@ -319,6 +329,7 @@
       pbipFiles,
       report,
       semantic,
+      dataModel: { loadedTables: dataModel.loadedTables },
       issues,
     };
   }
@@ -1069,10 +1080,13 @@
       for (const key of ["columns", "measures", "hierarchies", "partitions", "relationships"]) {
         mergeNamedItems(target[key], incoming[key] || []);
       }
+      if (incoming.data && !target.data) target.data = incoming.data;
     };
 
     for (const entry of entries.filter((item) => item.path.toLowerCase().endsWith(".tmdl"))) {
       const parsed = parseTmdl(entry.text, inferTableNameFromPath(entry.path), entry.path);
+      const inline = extractInlineData(entry.text);
+      if (inline && parsed.tables[0]) parsed.tables[0].data = inline;
       if (parsed.tables.length) {
         parsed.tables.forEach(addTable);
       }
@@ -1215,6 +1229,406 @@
     }
 
     return result;
+  }
+
+  // --- TMDLインラインデータ(Table.FromRows)解析 -----------------------
+
+  function extractInlineData(text) {
+    const anchor = text.indexOf("Table.FromRows");
+    if (anchor < 0) return null;
+
+    const rowsStart = text.indexOf("{", anchor);
+    if (rowsStart < 0) return null;
+    const rowsBlock = readBalanced(text, rowsStart, "{", "}");
+    if (!rowsBlock) return null;
+
+    const afterRows = rowsStart + rowsBlock.length;
+    const typeIdx = text.indexOf("type table", afterRows);
+    let columns = [];
+    if (typeIdx >= 0) {
+      const colStart = text.indexOf("[", typeIdx);
+      const colBlock = readBalanced(text, colStart, "[", "]");
+      if (colBlock) columns = parseTypeTable(colBlock);
+    }
+
+    const rows = parseRowList(rowsBlock);
+    if (!rows.length) return null;
+
+    if (!columns.length) {
+      const width = Math.max(...rows.map((row) => row.length));
+      columns = Array.from({ length: width }, (_, index) => ({ name: `Column${index + 1}`, type: "" }));
+    }
+
+    const records = rows.map((values) => {
+      const record = {};
+      columns.forEach((column, index) => {
+        record[column.name] = coerceValue(values[index], column.type);
+      });
+      return record;
+    });
+
+    return { columns, records };
+  }
+
+  function readBalanced(text, start, open, close) {
+    if (start < 0 || text[start] !== open) return "";
+    let depth = 0;
+    let inString = false;
+    for (let index = start; index < text.length; index += 1) {
+      const char = text[index];
+      if (inString) {
+        if (char === '"') {
+          if (text[index + 1] === '"') { index += 1; continue; }
+          inString = false;
+        }
+        continue;
+      }
+      if (char === '"') { inString = true; continue; }
+      if (char === open) depth += 1;
+      else if (char === close) {
+        depth -= 1;
+        if (depth === 0) return text.slice(start, index + 1);
+      }
+    }
+    return "";
+  }
+
+  function splitTopLevel(inner, separator = ",") {
+    const parts = [];
+    let depth = 0;
+    let inString = false;
+    let current = "";
+    for (let index = 0; index < inner.length; index += 1) {
+      const char = inner[index];
+      if (inString) {
+        current += char;
+        if (char === '"') {
+          if (inner[index + 1] === '"') { current += inner[index + 1]; index += 1; continue; }
+          inString = false;
+        }
+        continue;
+      }
+      if (char === '"') { inString = true; current += char; continue; }
+      if (char === "{" || char === "[" || char === "(") depth += 1;
+      else if (char === "}" || char === "]" || char === ")") depth -= 1;
+      if (char === separator && depth === 0) { parts.push(current); current = ""; continue; }
+      current += char;
+    }
+    if (current.trim() !== "" || parts.length) parts.push(current);
+    return parts;
+  }
+
+  function parseRowList(rowsBlock) {
+    const inner = rowsBlock.slice(1, -1); // 外側の { } を除去
+    return splitTopLevel(inner)
+      .map((chunk) => chunk.trim())
+      .filter((chunk) => chunk.startsWith("{"))
+      .map((rowText) => splitTopLevel(rowText.slice(1, -1)).map((cell) => parseMValue(cell.trim())));
+  }
+
+  function parseTypeTable(colBlock) {
+    const inner = colBlock.slice(1, -1);
+    return splitTopLevel(inner)
+      .map((part) => part.trim())
+      .filter(Boolean)
+      .map((part) => {
+        const eq = part.indexOf("=");
+        const rawName = eq >= 0 ? part.slice(0, eq) : part;
+        const type = eq >= 0 ? part.slice(eq + 1).trim() : "";
+        return { name: cleanMName(rawName), type };
+      });
+  }
+
+  function cleanMName(value) {
+    let text = String(value || "").trim();
+    if (text.startsWith('#"') && text.endsWith('"')) return text.slice(2, -1);
+    if (text.startsWith('"') && text.endsWith('"')) return text.slice(1, -1).replace(/""/g, '"');
+    return text;
+  }
+
+  function parseMValue(token) {
+    const text = token.trim();
+    if (text === "" || /^null$/i.test(text)) return null;
+    if (/^true$/i.test(text)) return true;
+    if (/^false$/i.test(text)) return false;
+    if (text.startsWith('"')) return text.slice(1, -1).replace(/""/g, '"');
+    return text;
+  }
+
+  function coerceValue(value, type) {
+    if (value == null) return null;
+    if (/Int64|number|Decimal|Double|Currency|Percentage/i.test(type)) {
+      const number = Number(value);
+      return Number.isFinite(number) ? number : value;
+    }
+    return value;
+  }
+
+  // --- 簡易DAX測定値の評価 --------------------------------------------
+
+  function buildDataModel(semantic) {
+    const byName = new Map();
+    const loadedTables = [];
+    for (const table of semantic.tables) {
+      if (!table.data?.records?.length) continue;
+      const measures = new Map((table.measures || []).map((measure) => [measure.name, measure]));
+      const model = {
+        name: table.name,
+        columns: table.data.columns,
+        records: table.data.records,
+        measures,
+      };
+      byName.set(table.name, model);
+      byName.set(normalizeName(table.name), model);
+      loadedTables.push({ name: table.name, rows: table.data.records.length });
+    }
+    return { byName, loadedTables };
+  }
+
+  function normalizeName(value) {
+    return String(value || "").toLowerCase().replace(/[\s_'"\[\]]+/g, "");
+  }
+
+  function resolveColumn(table, name) {
+    if (!table) return null;
+    const target = normalizeName(name);
+    const column = table.columns.find((item) => normalizeName(item.name) === target);
+    return column ? column.name : null;
+  }
+
+  function aggregate(records, columnName, func) {
+    const values = records
+      .map((record) => record[columnName])
+      .filter((value) => value !== "" && value != null);
+    const numbers = values.map((value) => Number(value)).filter((value) => Number.isFinite(value));
+    switch ((func || "sum").toLowerCase()) {
+      case "count": return values.length;
+      case "countrows": return records.length;
+      case "distinctcount": return new Set(values).size;
+      case "average":
+      case "avg": return numbers.length ? numbers.reduce((a, b) => a + b, 0) / numbers.length : 0;
+      case "min": return numbers.length ? Math.min(...numbers) : 0;
+      case "max": return numbers.length ? Math.max(...numbers) : 0;
+      default: return numbers.reduce((a, b) => a + b, 0);
+    }
+  }
+
+  function evaluateDax(expression, records, table) {
+    if (!expression) return null;
+    let body = String(expression).trim();
+
+    const calc = body.match(/^CALCULATE\s*\(([\s\S]*)\)$/i);
+    let rows = records;
+    if (calc) {
+      const args = splitTopLevel(calc[1]);
+      body = args[0].trim();
+      for (const filterText of args.slice(1)) {
+        const filter = parseDaxFilter(filterText, table);
+        if (filter) rows = rows.filter((record) => matchDaxFilter(record, filter));
+      }
+    }
+
+    const agg = body.match(/^(COUNTROWS|DISTINCTCOUNT|SUM|MIN|MAX|AVERAGE)\s*\(([\s\S]*)\)$/i);
+    if (!agg) return null;
+    const func = agg[1].toUpperCase();
+    if (func === "COUNTROWS") return rows.length;
+
+    const columnName = resolveColumn(table, parseColumnRef(agg[2]));
+    if (!columnName) return null;
+    return aggregate(rows, columnName, func === "DISTINCTCOUNT" ? "distinctcount" : func);
+  }
+
+  function parseColumnRef(text) {
+    const match = String(text).match(/\[([^\]]+)\]/);
+    if (match) return match[1];
+    return String(text).replace(/['"]/g, "").trim();
+  }
+
+  function parseDaxFilter(text, table) {
+    const match = String(text).match(/\[([^\]]+)\]\s*(=|<>|>=|<=|>|<)\s*(.+)$/);
+    if (!match) return null;
+    const column = resolveColumn(table, match[1]);
+    if (!column) return null;
+    let rawValue = match[3].trim();
+    let value;
+    if (/^".*"$/.test(rawValue)) value = rawValue.slice(1, -1).replace(/""/g, '"');
+    else if (/^-?\d+(\.\d+)?$/.test(rawValue)) value = Number(rawValue);
+    else value = rawValue.replace(/^['"]|['"]$/g, "");
+    return { column, op: match[2], value };
+  }
+
+  function matchDaxFilter(record, filter) {
+    const cell = record[filter.column];
+    const left = typeof filter.value === "number" ? Number(cell) : String(cell ?? "");
+    switch (filter.op) {
+      case "=": return left == filter.value;
+      case "<>": return left != filter.value;
+      case ">": return left > filter.value;
+      case "<": return left < filter.value;
+      case ">=": return left >= filter.value;
+      case "<=": return left <= filter.value;
+      default: return true;
+    }
+  }
+
+  function formatMeasureValue(value, formatString) {
+    if (value == null || !Number.isFinite(Number(value))) return "—";
+    const number = Number(value);
+    if (!formatString) return groupThousands(roundTo(number, 2));
+
+    const literals = [...formatString.matchAll(/"([^"]*)"/g)].map((match) => match[1]).join("");
+    const core = formatString.replace(/"[^"]*"/g, "").trim();
+    const decimalPart = core.split(".")[1] || "";
+    const decimals = (decimalPart.match(/[0#]/g) || []).length;
+    const grouped = core.includes(",");
+    const percent = core.includes("%");
+
+    let scaled = percent ? number * 100 : number;
+    let text = scaled.toFixed(decimals);
+    if (grouped) text = groupThousands(text);
+    return `${text}${percent ? "%" : ""}${literals}`;
+  }
+
+  function roundTo(value, decimals) {
+    const factor = 10 ** decimals;
+    return String(Math.round(value * factor) / factor);
+  }
+
+  function groupThousands(numericText) {
+    const [intPart, decPart] = String(numericText).split(".");
+    const sign = intPart.startsWith("-") ? "-" : "";
+    const digits = intPart.replace("-", "").replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+    return `${sign}${digits}${decPart != null ? `.${decPart}` : ""}`;
+  }
+
+  // --- ビジュアルへ実データを付与 --------------------------------------
+
+  function hydrateVisualData(report, dataModel) {
+    if (!dataModel.byName.size) return;
+    const cache = new Map();
+    for (const page of report.pages) {
+      for (const visual of page.visuals) {
+        const data = computeVisualData(visual, dataModel);
+        visual.data = data;
+        cache.set(`${page.id}/${visual.id}`, data);
+      }
+    }
+    for (const visual of report.visuals) {
+      visual.data = cache.get(`${visual.pageId}/${visual.id}`) || null;
+    }
+  }
+
+  function roleFieldsByKind(visual, kind) {
+    const result = [];
+    for (const role of visual.roles || []) {
+      for (const field of role.fields) {
+        if (classifyRole(role.role, field.kind) === kind) result.push(field);
+      }
+    }
+    return result;
+  }
+
+  function resolveTableFor(fields, dataModel) {
+    for (const field of fields) {
+      if (!field?.table) continue;
+      const table = dataModel.byName.get(field.table) || dataModel.byName.get(normalizeName(field.table));
+      if (table) return table;
+    }
+    if (dataModel.loadedTables.length === 1) {
+      return dataModel.byName.get(dataModel.loadedTables[0].name);
+    }
+    return null;
+  }
+
+  function evaluateField(field, records, table) {
+    if (!field) return null;
+    if (field.kind === "measure") {
+      const measure = table.measures.get(field.name);
+      if (measure) return { value: evaluateDax(measure.expression, records, table), format: measure.formatString };
+      return null;
+    }
+    const columnName = resolveColumn(table, field.name);
+    if (!columnName) return null;
+    return { value: aggregate(records, columnName, field.agg), format: "" };
+  }
+
+  function computeVisualData(visual, dataModel) {
+    const categories = roleFieldsByKind(visual, "category");
+    const values = roleFieldsByKind(visual, "value");
+    if (!categories.length && !values.length) return null;
+
+    const type = visual.type.toLowerCase();
+    const table = resolveTableFor([...values, ...categories], dataModel);
+    if (!table) return null;
+
+    const valueField = values[0];
+    const categoryField = categories[0];
+    const categoryColumn = categoryField ? resolveColumn(table, categoryField.name) : null;
+
+    // テーブル / マトリックス
+    if (type.includes("table") || type.includes("pivot") || type.includes("matrix")) {
+      const columnFields = [...categories, ...values.filter((field) => field.kind !== "measure"), ...values.filter((field) => field.kind === "measure")];
+      const plain = columnFields.filter((field) => field.kind !== "measure");
+      const columnNames = plain.map((field) => resolveColumn(table, field.name) || field.name);
+      const rows = table.records.slice(0, 8).map((record) => columnNames.map((name) => formatCell(record[name])));
+      return { kind: "table", columns: plain.map((field) => field.display), rows, total: table.records.length };
+    }
+
+    // スライサー
+    if (type.includes("slicer")) {
+      const items = [];
+      const seen = new Set();
+      for (const record of table.records) {
+        const text = String(categoryColumn ? record[categoryColumn] ?? "" : "").trim();
+        if (!text || seen.has(text)) continue;
+        seen.add(text);
+        items.push(text);
+        if (items.length >= 14) break;
+      }
+      return { kind: "slicer", field: categoryField?.display || "", items };
+    }
+
+    // カード / KPI(カテゴリなし)
+    if ((type.includes("card") || type.includes("kpi") || type.includes("gauge") || type.includes("multirow")) || (!categoryColumn && valueField)) {
+      const evaluated = valueField ? evaluateField(valueField, table.records, table) : null;
+      if (!evaluated) return null;
+      return { kind: "card", value: evaluated.value, text: formatMeasureValue(evaluated.value, evaluated.format), label: valueField.display };
+    }
+
+    // カテゴリ系チャート
+    if (categoryColumn && valueField) {
+      const groups = new Map();
+      for (const record of table.records) {
+        const label = String(record[categoryColumn] ?? "").trim() || "(空白)";
+        if (!groups.has(label)) groups.set(label, []);
+        groups.get(label).push(record);
+      }
+      let series = [...groups.entries()].map(([label, records]) => {
+        const evaluated = evaluateField(valueField, records, table);
+        return { label, value: Number(evaluated?.value) || 0, format: evaluated?.format || "" };
+      });
+      if (!type.includes("line") && !type.includes("area")) {
+        series.sort((a, b) => b.value - a.value);
+      }
+      series = series.slice(0, 12);
+      const max = Math.max(1, ...series.map((point) => Math.abs(point.value)));
+      return {
+        kind: "category",
+        categoryLabel: categoryField.display,
+        valueLabel: valueField.display,
+        format: series[0]?.format || "",
+        max,
+        series,
+      };
+    }
+
+    return null;
+  }
+
+  function formatCell(value) {
+    if (value == null) return "";
+    if (typeof value === "number") return groupThousands(roundTo(value, 4));
+    return String(value);
   }
 
   function render() {
@@ -1407,32 +1821,47 @@
       return visual.style?.fill ? "" : `<div class="mini-shape" aria-hidden="true"></div>`;
     }
 
+    const data = visual.data;
+
     if (type.includes("card") || type.includes("kpi") || type.includes("gauge") || type.includes("multirowcard")) {
+      const valueText = data?.kind === "card" ? data.text : "—";
+      const label = (data?.kind === "card" && data.label) || valueLabel;
       return `
         <div>
-          <div class="mini-card-value">—</div>
-          <div class="mini-card-label">${escapeHtml(valueLabel)}</div>
+          <div class="mini-card-value">${escapeHtml(valueText)}</div>
+          <div class="mini-card-label">${escapeHtml(label)}</div>
         </div>
       `;
     }
 
     if (type.includes("line") || type.includes("area")) {
+      const path = data?.kind === "category" ? linePath(data.series, data.max) : "M5 52L28 35L48 42L74 18L96 27L116 10";
       return `
         <svg class="mini-line" viewBox="0 0 120 64" preserveAspectRatio="none" aria-hidden="true">
           <path d="M5 58H116" stroke="#ded8ca" stroke-width="1" />
-          <path d="M5 52L28 35L48 42L74 18L96 27L116 10" fill="none" stroke="${escapeAttribute(color)}" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" />
+          <path d="${escapeAttribute(path)}" fill="none" stroke="${escapeAttribute(color)}" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" />
         </svg>
-        ${miniAxis(categoryLabel, valueLabel)}
+        ${miniAxis(data?.categoryLabel || categoryLabel, data?.valueLabel || valueLabel)}
       `;
     }
 
     if (type.includes("pie") || type.includes("donut")) {
-      const stops = pieGradient(theme);
+      const stops = data?.kind === "category" ? pieGradientFromData(data.series, theme) : pieGradient(theme);
       const inner = type.includes("donut") ? `<span class="mini-pie-hole"></span>` : "";
-      return `<div class="mini-pie" style="background:conic-gradient(${stops})" aria-hidden="true">${inner}</div>`;
+      const legend = data?.kind === "category" ? pieLegend(data.series, theme, data.format) : "";
+      return `
+        <div class="mini-pie-wrap">
+          <div class="mini-pie" style="background:conic-gradient(${stops})" aria-hidden="true">${inner}</div>
+          ${legend}
+        </div>
+      `;
     }
 
     if (type.includes("bar") || type.includes("column") || type.includes("histogram") || type.includes("funnel") || type.includes("waterfall")) {
+      const horizontal = type.includes("bar") && !type.includes("column");
+      if (data?.kind === "category" && data.series.length) {
+        return renderDataBars(data, theme, horizontal);
+      }
       const heights = [42, 70, 54, 86, 62];
       const bars = heights
         .map((height, index) => `<span style="height:${height}%;background:${escapeAttribute(theme[index % theme.length])}"></span>`)
@@ -1454,26 +1883,24 @@
     }
 
     if (type.includes("slicer")) {
-      const options = categories.length
-        ? categories.slice(0, 1).map((field) => field.display)
-        : [categoryLabel];
+      const items = data?.kind === "slicer" && data.items.length ? data.items : ["項目 1", "項目 2", "項目 3"];
       return `
         <div class="mini-slicer">
           <span class="mini-slicer-head">${escapeHtml(categoryLabel || "Slicer")}</span>
-          ${["項目 1", "項目 2", "項目 3"].map((item) => `<span><i></i>${escapeHtml(item)}</span>`).join("")}
+          ${items.slice(0, 6).map((item) => `<span><i></i>${escapeHtml(item)}</span>`).join("")}
         </div>
       `;
     }
 
     // テーブル / マトリックス
     if (type.includes("table") || type.includes("pivot") || type.includes("matrix")) {
-      const columns = [...categories, ...values];
+      const columns = data?.kind === "table" ? data.columns : [...categories, ...values].map((field) => field.display);
       if (columns.length) {
-        const head = columns.slice(0, 4).map((field) => `<th>${escapeHtml(field.display)}</th>`).join("");
-        const body = Array.from({ length: 4 }, () =>
-          `<tr>${columns.slice(0, 4).map(() => "<td>—</td>").join("")}</tr>`,
-        ).join("");
-        return `<table class="mini-grid"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
+        const head = columns.slice(0, 5).map((name) => `<th>${escapeHtml(name)}</th>`).join("");
+        const rows = data?.kind === "table" && data.rows.length
+          ? data.rows.slice(0, 5).map((row) => `<tr>${row.slice(0, 5).map((cell) => `<td>${escapeHtml(String(cell))}</td>`).join("")}</tr>`).join("")
+          : Array.from({ length: 4 }, () => `<tr>${columns.slice(0, 5).map(() => "<td>—</td>").join("")}</tr>`).join("");
+        return `<table class="mini-grid"><thead><tr>${head}</tr></thead><tbody>${rows}</tbody></table>`;
       }
     }
 
@@ -1499,6 +1926,82 @@
         return `${theme[index % theme.length]} ${start}% ${acc}%`;
       })
       .join(", ");
+  }
+
+  function renderDataBars(data, theme, horizontal) {
+    const bars = data.series
+      .map((point, index) => {
+        const ratio = Math.max(0, Math.abs(point.value) / data.max);
+        const size = `${(ratio * 100).toFixed(1)}%`;
+        const color = escapeAttribute(theme[index % theme.length]);
+        const valueText = formatMeasureValue(point.value, data.format);
+        if (horizontal) {
+          return `
+            <div class="hbar-row" title="${escapeAttribute(`${point.label}: ${valueText}`)}">
+              <span class="hbar-label">${escapeHtml(point.label)}</span>
+              <span class="hbar-track"><span class="hbar-fill" style="width:${size};background:${color}"></span></span>
+              <span class="hbar-value">${escapeHtml(valueText)}</span>
+            </div>
+          `;
+        }
+        return `
+          <div class="vbar" title="${escapeAttribute(`${point.label}: ${valueText}`)}">
+            <span class="vbar-value">${escapeHtml(valueText)}</span>
+            <span class="vbar-fill" style="height:${size};background:${color}"></span>
+            <span class="vbar-label">${escapeHtml(point.label)}</span>
+          </div>
+        `;
+      })
+      .join("");
+    return `<div class="${horizontal ? "hbars" : "vbars"}">${bars}</div>`;
+  }
+
+  function linePath(series, max) {
+    if (!series.length) return "M5 58H116";
+    const left = 5;
+    const right = 116;
+    const top = 8;
+    const bottom = 58;
+    const step = series.length > 1 ? (right - left) / (series.length - 1) : 0;
+    return series
+      .map((point, index) => {
+        const x = left + step * index;
+        const ratio = Math.max(0, Math.abs(point.value) / max);
+        const y = bottom - ratio * (bottom - top);
+        return `${index === 0 ? "M" : "L"}${x.toFixed(1)} ${y.toFixed(1)}`;
+      })
+      .join("");
+  }
+
+  function pieGradientFromData(series, theme) {
+    const total = series.reduce((sum, point) => sum + Math.max(0, point.value), 0) || 1;
+    let acc = 0;
+    return series
+      .map((point, index) => {
+        const start = (acc / total) * 100;
+        acc += Math.max(0, point.value);
+        const end = (acc / total) * 100;
+        return `${theme[index % theme.length]} ${start.toFixed(1)}% ${end.toFixed(1)}%`;
+      })
+      .join(", ");
+  }
+
+  function pieLegend(series, theme, format) {
+    return `
+      <div class="mini-legend">
+        ${series
+          .slice(0, 6)
+          .map(
+            (point, index) => `
+              <span class="legend-item">
+                <i style="background:${escapeAttribute(theme[index % theme.length])}"></i>
+                ${escapeHtml(point.label)} <b>${escapeHtml(formatMeasureValue(point.value, format))}</b>
+              </span>
+            `,
+          )
+          .join("")}
+      </div>
+    `;
   }
 
   function renderInspector(page) {
@@ -1732,6 +2235,7 @@
             fields: visual.fields,
             style: visual.style,
             textContent: visual.textContent,
+            data: visual.data,
             path: visual.path,
           })),
         })),
