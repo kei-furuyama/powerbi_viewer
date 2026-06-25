@@ -198,12 +198,33 @@ const fidelityProject = analyzeProject(
       }),
       size: 200,
     },
+    {
+      path: "F.Report/definition/pages/P/visuals/title/visual.json",
+      text: JSON.stringify({
+        name: "title",
+        position: { x: 40, y: 18, width: 1300, height: 50, z: 2 },
+        visual: {
+          visualType: "textbox",
+          objects: {
+            general: [{ properties: { paragraphs: [{ textRuns: [{ value: "ダッシュボード", textStyle: { fontWeight: "bold", fontSize: "22pt", color: "#FFFFFF" } }] }] } }],
+          },
+        },
+      }),
+      size: 200,
+    },
   ],
   [],
 );
 
 const header = fidelityProject.report.pages[0].visuals.find((visual) => visual.id === "header");
 const kpi = fidelityProject.report.pages[0].visuals.find((visual) => visual.id === "kpi");
+const titleTb = fidelityProject.report.pages[0].visuals.find((visual) => visual.id === "title");
+assert.ok(titleTb.paragraphs.length >= 1, "textbox paragraphs extracted");
+const run = titleTb.paragraphs[0].runs[0];
+assert.equal(run.text, "ダッシュボード", "textbox run text");
+assert.equal(run.color, "#FFFFFF", "textbox run color from textStyle");
+assert.equal(run.sizePt, 22, "textbox run font size (pt)");
+assert.equal(run.bold, true, "textbox run bold");
 assert.equal(header.style.fill, "#1F5FA6", "shape fill color");
 assert.equal(header.hasExplicitTitle, false, "shape has no auto title bar");
 assert.equal(kpi.hasExplicitTitle, false, "card has no auto title bar");
@@ -334,6 +355,76 @@ assert.equal(evalIn("IF(SUM('Sales'[数量]) > 5, \"多\", \"少\")"), "多", "I
 assert.equal(evalIn("ROUND(DIVIDE(10, 3), 2)"), 3.33, "ROUND");
 
 console.log("dax engine smoke test passed");
+
+// --- ビジュアルフィルタ + リレーション ---
+const relProject = analyzeProject(
+  [
+    { path: "R.pbip", text: JSON.stringify({ version: "1.0", artifacts: [{ report: { path: "R.Report" } }] }), size: 40 },
+    { path: "R.Report/definition/pages/pages.json", text: JSON.stringify({ pageOrder: ["P"] }), size: 30 },
+    { path: "R.Report/definition/pages/P/page.json", text: JSON.stringify({ name: "P", displayName: "P", width: 1280, height: 720 }), size: 60 },
+    {
+      path: "R.Report/definition/pages/P/visuals/c/visual.json",
+      text: JSON.stringify({
+        name: "c",
+        position: { x: 0, y: 0, width: 200, height: 120, z: 0 },
+        filterConfig: {
+          filters: [
+            {
+              name: "f1",
+              field: { Column: { Expression: { SourceRef: { Entity: "売上" } }, Property: "地域" } },
+              filter: { Where: [{ Condition: { In: { Expressions: [{ Column: { Property: "地域" } }], Values: [[{ Literal: { Value: "'東'" } }]] } } }] },
+            },
+          ],
+        },
+        visual: { visualType: "cardVisual", query: { queryState: { Data: { projections: [{ field: { Measure: { Expression: { SourceRef: { Entity: "売上" } }, Property: "合計" } }, queryRef: "売上.合計", nativeQueryRef: "合計" }] } } } },
+      }),
+      size: 200,
+    },
+    {
+      path: "R.SemanticModel/definition/tables/売上.tmdl",
+      text: [
+        "table 売上",
+        "\tmeasure 合計 = SUM('売上'[金額])",
+        "\tcolumn 地域",
+        "\t\tdataType: string",
+        "\tcolumn 金額",
+        "\t\tdataType: int64",
+        "\tpartition 売上 = m",
+        "\t\tsource =",
+        "\t\t\tlet Source = Table.FromRows({ {\"東\", 100}, {\"東\", 50}, {\"西\", 999} }, type table [地域 = text, 金額 = Int64.Type]) in Source",
+      ].join("\n"),
+      size: 300,
+    },
+    {
+      path: "R.SemanticModel/definition/relationships.tmdl",
+      text: [
+        "relationship rel1",
+        "\tfromColumn: 売上.地域",
+        "\ttoColumn: '地域マスタ'.地域",
+        "\ttoCardinality: one",
+        "\tcrossFilteringBehavior: bothDirections",
+      ].join("\n"),
+      size: 160,
+    },
+  ],
+  [],
+);
+
+// ビジュアルフィルタ(地域=東)で合計=150になる(西の999は除外)
+const filteredCard = relProject.report.pages[0].visuals.find((visual) => visual.id === "c");
+assert.equal(filteredCard.filters.length, 1, "visual filter parsed");
+assert.equal(filteredCard.data.text, "150", "measure respects visual-level filter");
+
+// リレーション解析
+const rel = relProject.semantic.relationships.find((relationship) => relationship.name === "rel1");
+assert.ok(rel, "relationship parsed");
+assert.equal(rel.fromTable, "売上");
+assert.equal(rel.fromColumn, "地域");
+assert.equal(rel.toTable, "地域マスタ");
+assert.equal(rel.toColumn, "地域");
+assert.equal(rel.crossFilter, "bothDirections");
+
+console.log("filter & relationship smoke test passed");
 
 const legacyReportConfig = {
   name: "legacy_donut",

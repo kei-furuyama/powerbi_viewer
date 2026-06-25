@@ -607,6 +607,8 @@
     const fields = extractFields(visualRoot);
     const style = extractVisualStyle(visualObject, visualRoot);
     const textContent = extractRichText(visualObject, visualRoot);
+    const paragraphs = extractTextParagraphs(visualObject, visualRoot);
+    const filters = extractVisualFilters(visualRoot, visualObject);
     const explicitTitle = style.title.text || extractTitle(visualRoot);
     const title = explicitTitle || textContent || typeLabel(type);
 
@@ -623,6 +625,8 @@
       fields,
       style,
       textContent,
+      paragraphs,
+      filters,
       filterCount: countKeyMatches(visualRoot, /filter/i),
       hasQuery: Boolean(visualObject.query || visualRoot.query || visualObject.prototypeQuery),
       jsonStatus: json ? "parsed" : "missing",
@@ -883,6 +887,114 @@
       .map((run) => run?.value ?? readExpr(run?.value) ?? "")
       .join("")
       .trim();
+  }
+
+  // テキストボックスの段落を、書式付きの行(段落)→ラン構造として抽出
+  function extractTextParagraphs(visualObject, visualRoot) {
+    const objects = visualObject?.objects || visualRoot?.objects || {};
+    const props =
+      firstObjectProps(objects.general) || firstObjectProps(objects.text) || firstObjectProps(objects.textBox);
+    const paragraphs = props?.paragraphs;
+    if (!Array.isArray(paragraphs)) return [];
+
+    return paragraphs
+      .map((paragraph) => {
+        const align = cssAlignName(
+          readExprString(paragraph?.horizontalTextAlignment) || paragraph?.horizontalTextAlignment || "",
+        );
+        const runs = (paragraph?.textRuns || [])
+          .map((run) => {
+            const value = typeof run?.value === "string" ? run.value : readExpr(run?.value);
+            if (value == null || value === "") return null;
+            const ts = run?.textStyle || {};
+            return {
+              text: String(value),
+              color: normalizeColor(ts.color),
+              sizePt: parseFontSize(ts.fontSize),
+              bold: /bold/i.test(String(ts.fontWeight || "")) || ts.fontWeight === 700,
+              italic: /italic/i.test(String(ts.fontStyle || "")),
+              font: typeof ts.fontFamily === "string" ? ts.fontFamily : "",
+            };
+          })
+          .filter(Boolean);
+        return runs.length ? { align, runs } : null;
+      })
+      .filter(Boolean);
+  }
+
+  // ビジュアルレベルフィルタ(filterConfig.filters)を解析
+  function extractVisualFilters(visualRoot, visualObject) {
+    const lists = [
+      visualRoot?.filterConfig?.filters,
+      visualObject?.filterConfig?.filters,
+      Array.isArray(visualRoot?.filters) ? visualRoot.filters : null,
+    ].filter(Array.isArray);
+
+    const filters = [];
+    for (const list of lists) {
+      for (const item of list) {
+        const conditions = [];
+        const where = item?.filter?.Where;
+        if (Array.isArray(where)) {
+          for (const clause of where) {
+            collectFilterConditions(clause?.Condition, false, conditions);
+          }
+        }
+        if (conditions.length) filters.push({ conditions });
+      }
+    }
+    return filters;
+  }
+
+  const COMPARISON_OPS = { 0: "=", 1: ">", 2: ">=", 3: "<", 4: "<=" };
+
+  function collectFilterConditions(condition, negate, out) {
+    if (!condition || typeof condition !== "object") return;
+
+    if (condition.Not?.Expression) {
+      collectFilterConditions(condition.Not.Expression, !negate, out);
+      return;
+    }
+    if (condition.And) {
+      collectFilterConditions(condition.And.Left, negate, out);
+      collectFilterConditions(condition.And.Right, negate, out);
+      return;
+    }
+    if (condition.In) {
+      const column = condition.In.Expressions?.[0]?.Column?.Property;
+      const values = (condition.In.Values || [])
+        .map((tuple) => parseDaxLiteral(tuple?.[0]?.Literal?.Value))
+        .filter((value) => value != null);
+      if (column && values.length) out.push({ column, kind: "in", values, negate });
+      return;
+    }
+    if (condition.Comparison) {
+      const column = condition.Comparison.Left?.Column?.Property;
+      const value = parseDaxLiteral(condition.Comparison.Right?.Literal?.Value);
+      const op = COMPARISON_OPS[condition.Comparison.ComparisonKind] || "=";
+      if (column && value != null) out.push({ column, kind: "compare", op, value, negate });
+    }
+  }
+
+  function parseDaxLiteral(raw) {
+    if (raw == null) return null;
+    let text = cleanLiteral(String(raw)).trim();
+    const numeric = text.replace(/[DLMF]$/i, "");
+    if (/^-?\d+(\.\d+)?$/.test(numeric)) return Number(numeric);
+    return text;
+  }
+
+  function parseFontSize(value) {
+    if (value == null) return null;
+    const number = Number(String(value).replace(/[^\d.]/g, ""));
+    return Number.isFinite(number) && number > 0 ? number : null;
+  }
+
+  function cssAlignName(value) {
+    const text = String(value).toLowerCase();
+    if (text.includes("right") || text.includes("end")) return "right";
+    if (text.includes("center")) return "center";
+    return "";
   }
 
   function normalizePosition(rawPosition, pageDimensions, index) {
@@ -1149,9 +1261,23 @@
           partitions: (table.partitions || []).map((partition) => ({ name: partition.name })),
         });
       }
+
+      for (const relationship of json.model?.relationships || json.relationships || []) {
+        semantic.relationships.push({
+          name: relationship.name || "",
+          fromTable: relationship.fromTable || "",
+          fromColumn: relationship.fromColumn || "",
+          toTable: relationship.toTable || "",
+          toColumn: relationship.toColumn || "",
+          crossFilter: relationship.crossFilteringBehavior || "",
+          toCardinality: relationship.toCardinality || "",
+          isActive: relationship.isActive !== false,
+        });
+      }
     }
 
     semantic.tables = [...tableMap.values()].sort((a, b) => a.name.localeCompare(b.name));
+    semantic.relationships = semantic.relationships.filter((relationship) => relationship.fromTable || relationship.fromColumn || relationship.name);
     return semantic;
   }
 
@@ -1241,9 +1367,25 @@
 
       const relationshipName = readTmdlDeclaration(line, "relationship");
       if (relationshipName) {
-        result.relationships.push({ name: relationshipName, path });
-        currentItem = null;
+        const relationship = { name: relationshipName, path };
+        result.relationships.push(relationship);
+        currentItem = { type: "relationship", item: relationship };
         continue;
+      }
+
+      if (currentItem?.type === "relationship") {
+        const relMatch = line.match(/^(fromColumn|toColumn|fromCardinality|toCardinality|crossFilteringBehavior|isActive)\s*:\s*(.+)$/i);
+        if (relMatch) {
+          const key = relMatch[1];
+          const value = relMatch[2].trim();
+          if (/^fromColumn$/i.test(key)) Object.assign(currentItem.item, prefixed("from", parseTmdlColumnRef(value)));
+          else if (/^toColumn$/i.test(key)) Object.assign(currentItem.item, prefixed("to", parseTmdlColumnRef(value)));
+          else if (/^fromCardinality$/i.test(key)) currentItem.item.fromCardinality = value;
+          else if (/^toCardinality$/i.test(key)) currentItem.item.toCardinality = value;
+          else if (/^crossFilteringBehavior$/i.test(key)) currentItem.item.crossFilter = value;
+          else if (/^isActive$/i.test(key)) currentItem.item.isActive = !/false/i.test(value);
+          continue;
+        }
       }
 
       if (currentItem && /^dataType\s*:/i.test(line)) {
@@ -1654,6 +1796,23 @@
       ctx.stack.delete(name);
       return result;
     }
+    // 同じテーブルに無ければモデル全体からメジャーを探す(テーブル横断参照)
+    if (ctx.model) {
+      for (const table of new Set(ctx.model.values())) {
+        if (table === ctx.table || !table.measures?.has(name)) continue;
+        if (ctx.stack.has(name)) return null;
+        ctx.stack.add(name);
+        const result = evaluateMeasureExpression(table.measures.get(name).expression, {
+          ...ctx,
+          table,
+          rows: table.records,
+          row: null,
+          vars: {},
+        });
+        ctx.stack.delete(name);
+        return result;
+      }
+    }
     if (ctx.row) {
       const column = resolveColumn(ctx.table, name);
       if (column) return ctx.row[column] ?? null;
@@ -1790,6 +1949,17 @@
       return num / den;
     }
 
+    if (name === "FORMAT") {
+      const value = evalDaxNode(args[0], ctx);
+      if (value == null) return "";
+      const pattern = evalDaxNode(args[1], ctx);
+      const numeric = typeof value === "number" ? value : Number(String(value).replace(/,/g, ""));
+      if (Number.isFinite(numeric) && String(value).trim() !== "") {
+        return formatMeasureValue(numeric, String(pattern || ""));
+      }
+      return String(value);
+    }
+
     if (name === "IF") {
       return truthy(evalDaxNode(args[0], ctx)) ? evalDaxNode(args[1], ctx) : (args[2] ? evalDaxNode(args[2], ctx) : null);
     }
@@ -1831,7 +2001,10 @@
   }
 
   function formatMeasureValue(value, formatString) {
-    if (value == null || !Number.isFinite(Number(value))) return "—";
+    if (value == null) return "—";
+    // 文字列を返すメジャー(FORMAT連結など)はそのまま表示
+    if (typeof value === "string" && !/^-?[\d,]+(\.\d+)?$/.test(value.trim())) return value;
+    if (!Number.isFinite(Number(value))) return "—";
     const number = Number(value);
     if (!formatString) return groupThousands(roundTo(number, 2));
 
@@ -1946,6 +2119,37 @@
     return null;
   }
 
+  function applyVisualFilters(records, filters, table) {
+    if (!filters?.length) return records;
+    return records.filter((record) =>
+      filters.every((filter) => filter.conditions.every((condition) => matchFilterCondition(record, condition, table))),
+    );
+  }
+
+  function matchFilterCondition(record, condition, table) {
+    const column = resolveColumn(table, condition.column);
+    const cell = column ? record[column] : undefined;
+    let hit;
+    if (condition.kind === "in") {
+      hit = condition.values.some((value) => looseEqual(cell, value));
+    } else {
+      const cmp = compareValues(cell, condition.value);
+      switch (condition.op) {
+        case ">": hit = cmp > 0; break;
+        case "<": hit = cmp < 0; break;
+        case ">=": hit = cmp >= 0; break;
+        case "<=": hit = cmp <= 0; break;
+        default: hit = cmp === 0;
+      }
+    }
+    return condition.negate ? !hit : hit;
+  }
+
+  function looseEqual(cell, value) {
+    if (typeof value === "number") return Number(cell) === value;
+    return String(cell ?? "") === String(value);
+  }
+
   function evaluateField(field, records, table, model) {
     if (!field) return null;
     if (field.kind === "measure") {
@@ -1968,6 +2172,9 @@
     if (!table) return null;
     const model = dataModel.byName;
 
+    // ビジュアルレベルフィルタを filter context として適用
+    const records = applyVisualFilters(table.records, visual.filters, table);
+
     const valueField = values[0];
     const categoryField = categories[0];
     const categoryColumn = categoryField ? resolveColumn(table, categoryField.name) : null;
@@ -1977,15 +2184,15 @@
       const columnFields = [...categories, ...values.filter((field) => field.kind !== "measure"), ...values.filter((field) => field.kind === "measure")];
       const plain = columnFields.filter((field) => field.kind !== "measure");
       const columnNames = plain.map((field) => resolveColumn(table, field.name) || field.name);
-      const rows = table.records.slice(0, 8).map((record) => columnNames.map((name) => formatCell(record[name])));
-      return { kind: "table", columns: plain.map((field) => field.display), rows, total: table.records.length };
+      const rows = records.slice(0, 8).map((record) => columnNames.map((name) => formatCell(record[name])));
+      return { kind: "table", columns: plain.map((field) => field.display), rows, total: records.length };
     }
 
     // スライサー
     if (type.includes("slicer")) {
       const items = [];
       const seen = new Set();
-      for (const record of table.records) {
+      for (const record of records) {
         const text = String(categoryColumn ? record[categoryColumn] ?? "" : "").trim();
         if (!text || seen.has(text)) continue;
         seen.add(text);
@@ -1997,7 +2204,7 @@
 
     // カード / KPI(カテゴリなし)
     if ((type.includes("card") || type.includes("kpi") || type.includes("gauge") || type.includes("multirow")) || (!categoryColumn && valueField)) {
-      const evaluated = valueField ? evaluateField(valueField, table.records, table, model) : null;
+      const evaluated = valueField ? evaluateField(valueField, records, table, model) : null;
       if (!evaluated) return null;
       return { kind: "card", value: evaluated.value, text: formatMeasureValue(evaluated.value, evaluated.format), label: valueField.display };
     }
@@ -2005,7 +2212,7 @@
     // カテゴリ系チャート
     if (categoryColumn && valueField) {
       const groups = new Map();
-      for (const record of table.records) {
+      for (const record of records) {
         const label = String(record[categoryColumn] ?? "").trim() || "(空白)";
         if (!groups.has(label)) groups.set(label, []);
         groups.get(label).push(record);
@@ -2151,7 +2358,9 @@
       const style = visual.style || {};
       const box = document.createElement("button");
       box.type = "button";
-      box.className = `visual-box ${visual.id === state.selectedVisualId ? "selected" : ""}`;
+      const lowerType = visual.type.toLowerCase();
+      const textLike = lowerType.includes("text") || lowerType.includes("shape");
+      box.className = `visual-box ${textLike ? "text-visual" : ""} ${visual.id === state.selectedVisualId ? "selected" : ""}`;
       box.style.left = `${percent(visual.position.x, page.width)}%`;
       box.style.top = `${percent(visual.position.y, page.height)}%`;
       box.style.width = `${percent(visual.position.width, page.width)}%`;
@@ -2184,7 +2393,7 @@
       box.innerHTML = `
         ${accentHtml}
         ${showTitle ? `<div class="visual-title" style="${titleStyle}">${escapeHtml(visual.title)}</div>` : ""}
-        <div class="visual-body">${renderVisualPreview(visual, theme)}</div>
+        <div class="visual-body">${renderVisualPreview(visual, theme, page.height)}</div>
       `;
       box.addEventListener("click", () => {
         state.selectedVisualId = visual.id;
@@ -2217,7 +2426,7 @@
     return result;
   }
 
-  function renderVisualPreview(visual, theme = DEFAULT_THEME_COLORS) {
+  function renderVisualPreview(visual, theme = DEFAULT_THEME_COLORS, pageHeight = DEFAULT_PAGE.height) {
     const type = visual.type.toLowerCase();
     const categories = roleFieldsOf(visual, "category");
     const values = roleFieldsOf(visual, "value");
@@ -2226,8 +2435,7 @@
     const color = theme[0] || "#118DFF";
 
     if (type.includes("textbox") || type.includes("text")) {
-      const text = visual.textContent || visual.title || "";
-      return `<div class="mini-text">${escapeHtml(text)}</div>`;
+      return renderTextbox(visual, pageHeight);
     }
 
     if (type.includes("image")) {
@@ -2330,6 +2538,35 @@
         ${Array.from({ length: 15 }, (_, index) => `<span style="${index < 3 ? "background:#c9c1b2" : ""}"></span>`).join("")}
       </div>
     `;
+  }
+
+  function renderTextbox(visual, pageHeight) {
+    const paragraphs = visual.paragraphs || [];
+    // フォントサイズはキャンバス高さ基準のコンテナ単位(cqh)へ変換し、ズームに追従させる
+    const toCqh = (pt) => ((pt * 96) / 72 / Math.max(1, pageHeight)) * 100;
+
+    if (paragraphs.length) {
+      const html = paragraphs
+        .map((paragraph) => {
+          const runs = paragraph.runs
+            .map((run) => {
+              const styles = [
+                run.color ? `color:${run.color}` : "",
+                run.bold ? "font-weight:700" : "",
+                run.italic ? "font-style:italic" : "",
+                run.sizePt ? `font-size:${toCqh(run.sizePt).toFixed(2)}cqh` : "",
+              ].filter(Boolean).join(";");
+              return `<span style="${styles}">${escapeHtml(run.text)}</span>`;
+            })
+            .join("");
+          return `<div class="mini-text-line" style="${paragraph.align ? `text-align:${paragraph.align}` : ""}">${runs}</div>`;
+        })
+        .join("");
+      return `<div class="mini-text rich">${html}</div>`;
+    }
+
+    const text = visual.textContent || visual.title || "";
+    return `<div class="mini-text">${escapeHtml(text)}</div>`;
   }
 
   function miniAxis(categoryLabel, valueLabel) {
@@ -2536,7 +2773,7 @@
       ? `<div class="model-summary">未使用のメジャー: <b>${totalUnused}</b> 件（ビジュアル・他メジャーから参照されていません）</div>`
       : `<div class="model-summary">すべてのメジャーがどこかで使用されています</div>`;
 
-    els.modelExplorer.innerHTML = summary + tables
+    els.modelExplorer.innerHTML = renderRelationships() + summary + tables
       .map((table) => {
         const measureRows = table.measures
           .map((measure) => {
@@ -2583,6 +2820,42 @@
         `;
       })
       .join("");
+  }
+
+  function renderRelationships() {
+    const relationships = state.project?.semantic.relationships || [];
+    const usable = relationships.filter((relationship) => relationship.fromTable && relationship.toTable);
+    if (!usable.length) {
+      return relationships.length
+        ? `<div class="model-summary rel-summary">リレーション ${relationships.length} 件（列情報なし）</div>`
+        : "";
+    }
+
+    const cardinalitySymbol = (relationship) => {
+      const many = (relationship.toCardinality || "").toLowerCase() === "many";
+      return many ? "* — *" : "* — 1";
+    };
+
+    const rows = usable
+      .map((relationship) => {
+        const both = /both/i.test(relationship.crossFilter || "");
+        return `
+          <div class="rel-row ${relationship.isActive === false ? "inactive" : ""}">
+            <span class="rel-end">${escapeHtml(relationship.fromTable)}<b>[${escapeHtml(relationship.fromColumn)}]</b></span>
+            <span class="rel-arrow" title="${both ? "双方向" : "単方向"} / ${escapeHtml(cardinalitySymbol(relationship))}">${both ? "↔" : "→"} <small>${escapeHtml(cardinalitySymbol(relationship))}</small></span>
+            <span class="rel-end">${escapeHtml(relationship.toTable)}<b>[${escapeHtml(relationship.toColumn)}]</b></span>
+            ${relationship.isActive === false ? `<span class="tag">非アクティブ</span>` : ""}
+          </div>
+        `;
+      })
+      .join("");
+
+    return `
+      <section class="rel-panel">
+        <div class="panel-title">リレーション (${usable.length})</div>
+        <div class="rel-list">${rows}</div>
+      </section>
+    `;
   }
 
   function formatDaxDisplay(expression) {
@@ -2765,6 +3038,26 @@
 
   function basename(path) {
     return normalizePath(path).split("/").filter(Boolean).pop() || "";
+  }
+
+  function parseTmdlColumnRef(value) {
+    // 例: '都道府県別'.都道府県  /  Table.Column  /  'A B'.'C D'
+    const text = String(value || "").trim();
+    let table = "";
+    let rest = text;
+    if (text[0] === "'") {
+      const end = text.indexOf("'", 1);
+      if (end > 0) { table = text.slice(1, end); rest = text.slice(end + 1); }
+    } else {
+      const dot = text.indexOf(".");
+      if (dot >= 0) { table = text.slice(0, dot); rest = text.slice(dot); }
+    }
+    const column = rest.replace(/^\s*\.\s*/, "").replace(/^'|'$/g, "").trim();
+    return { table: cleanFieldName(table), column: cleanFieldName(column) };
+  }
+
+  function prefixed(prefix, ref) {
+    return { [`${prefix}Table`]: ref.table, [`${prefix}Column`]: ref.column };
   }
 
   function inferTableNameFromPath(path) {
@@ -2953,10 +3246,25 @@
     return escapeHtml(value).replace(/`/g, "&#096;");
   }
 
+  function loadEntriesForPreview(entries) {
+    const project = analyzeProject(entries, []);
+    state.project = project;
+    state.selectedPageId = project.report.pages[0]?.id || null;
+    state.selectedVisualId = project.report.pages[0]?.visuals[0]?.id || null;
+    state.activeTab = project.report.pages.length ? "canvas" : "issues";
+    if (typeof document !== "undefined") {
+      if (!Object.keys(els).length) bindElements();
+      setStatus(makeProjectStatus(project));
+      render();
+    }
+    return project;
+  }
+
   globalTarget.PBIPViewerParser = {
     analyzeProject,
     parseTmdl,
     evaluateDax,
     extractInlineData,
+    loadEntriesForPreview,
   };
 })();

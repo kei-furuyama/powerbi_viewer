@@ -401,6 +401,7 @@ select {
   border: 1px solid var(--line-strong);
   box-shadow: var(--shadow);
   overflow: hidden;
+  container-type: size;
   font-family: "Segoe UI", "Segoe UI Web (West European)", -apple-system, "Hiragino Kaku Gothic ProN", "Yu Gothic UI", Meiryo, sans-serif;
 }
 
@@ -441,6 +442,22 @@ select {
   border-color: var(--accent);
   box-shadow: 0 0 0 2px rgba(0, 124, 114, 0.17);
   z-index: 3;
+}
+
+/* テキストボックス/図形は既定で背景・枠線を持たない(Power BIに合わせ透明) */
+.visual-box.text-visual {
+  background: transparent;
+  border-color: transparent;
+}
+
+.visual-box.text-visual .visual-body {
+  padding: 3px 7px;
+  align-items: start;
+}
+
+.visual-box.text-visual:hover,
+.visual-box.text-visual.selected {
+  border-color: var(--accent);
 }
 
 .visual-title {
@@ -718,6 +735,20 @@ select {
   -webkit-box-orient: vertical;
 }
 
+/* textStyle(色・サイズ・太字)を反映するリッチテキスト */
+.mini-text.rich {
+  display: block;
+  width: 100%;
+  line-height: 1.25;
+  -webkit-line-clamp: none;
+}
+
+.mini-text-line {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .mini-image {
   height: 100%;
   min-height: 42px;
@@ -939,6 +970,60 @@ td code,
   font-size: 0.86rem;
 }
 
+.rel-panel {
+  grid-column: 1 / -1;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  padding-bottom: 10px;
+}
+
+.rel-panel .panel-title {
+  padding: 12px 12px 6px;
+}
+
+.rel-list {
+  display: grid;
+  gap: 7px;
+  padding: 0 12px;
+}
+
+.rel-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface-soft);
+  font-size: 0.84rem;
+}
+
+.rel-row.inactive {
+  opacity: 0.6;
+}
+
+.rel-end {
+  white-space: nowrap;
+}
+
+.rel-end b {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.rel-arrow {
+  color: var(--muted);
+  white-space: nowrap;
+  font-weight: 700;
+}
+
+.rel-arrow small {
+  font-weight: 400;
+  font-size: 0.72rem;
+}
+
 .model-table .panel-title {
   padding: 10px 12px 0;
 }
@@ -1004,11 +1089,12 @@ td code,
   background: var(--surface);
   border: 1px solid var(--line);
   border-radius: 5px;
-  overflow-x: auto;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 0.74rem;
   line-height: 1.45;
-  white-space: pre;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: anywhere;
   color: #2a2a2a;
 }
 
