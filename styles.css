@@ -583,25 +583,60 @@ select {
   display: flex;
   gap: 8px;
   align-items: center;
+  justify-content: center;
   height: 100%;
   min-height: 0;
 }
 
+/* 凡例の位置(legend.position)を反映 */
+.mini-pie-wrap.legend-right { flex-direction: row; }
+.mini-pie-wrap.legend-left { flex-direction: row-reverse; }
+.mini-pie-wrap.legend-bottom { flex-direction: column; }
+.mini-pie-wrap.legend-top { flex-direction: column-reverse; }
+
+.mini-pie-wrap.legend-bottom,
+.mini-pie-wrap.legend-top {
+  gap: 4px;
+}
+
+.mini-pie-wrap.legend-bottom .mini-legend,
+.mini-pie-wrap.legend-top .mini-legend {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 2px 10px;
+}
+
 .mini-pie {
-  width: 100%;
-  height: 100%;
-  min-height: 48px;
   aspect-ratio: 1 / 1;
-  max-width: 96px;
   flex: 0 0 auto;
-  margin: 0;
+  margin: 0 auto;
   border-radius: 50%;
   position: relative;
 }
 
-.mini-pie-wrap .mini-pie {
-  width: 40%;
-  max-width: 88px;
+/* 凡例が右/左: 円は幅基準で控えめに */
+.mini-pie-wrap.legend-right .mini-pie,
+.mini-pie-wrap.legend-left .mini-pie {
+  width: 42%;
+  max-width: 120px;
+  height: auto;
+}
+
+/* 凡例なし: 円は高さ基準で大きく中央に */
+.mini-pie-wrap.legend-none .mini-pie {
+  height: 100%;
+  width: auto;
+  max-width: 100%;
+}
+
+/* 凡例が上下: 円を控えめにして凡例の場所を確保 */
+.mini-pie-wrap.legend-bottom .mini-pie,
+.mini-pie-wrap.legend-top .mini-pie {
+  height: 62%;
+  width: auto;
+  max-width: 88%;
+  flex: 0 0 auto;
 }
 
 .mini-legend {

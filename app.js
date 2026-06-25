@@ -769,6 +769,9 @@
     const borderProps = firstObjectProps(containerObjects.border) || firstObjectProps(objects.border);
     const fillProps = firstObjectProps(objects.fill);
 
+    const legendProps = firstObjectProps(objects.legend);
+    const labelsProps = firstObjectProps(objects.labels) || firstObjectProps(objects.dataLabels) || firstObjectProps(objects.detailLabels);
+
     return {
       fill: readExprColor(fillProps?.fillColor) || readExprColor(fillProps?.color),
       title: {
@@ -787,9 +790,28 @@
         show: readExprBool(borderProps?.show) === true,
         radius: readExprNumber(borderProps?.radius),
       },
+      legend: {
+        // legendオブジェクトが存在し show:false の時だけ非表示、未指定は既定ON
+        show: legendProps ? readExprBool(legendProps.show) !== false : true,
+        explicit: Boolean(legendProps),
+        position: legendPosition(readExprString(legendProps?.position)),
+      },
+      dataLabels: {
+        show: labelsProps ? readExprBool(labelsProps.show) !== false : null,
+      },
       card: extractCardStyle(objects),
       dataColors: extractDataColors(objects),
     };
+  }
+
+  function legendPosition(raw) {
+    const text = String(raw || "").toLowerCase();
+    if (!text) return "";
+    if (text.includes("bottom")) return "bottom";
+    if (text.includes("top")) return "top";
+    if (text.includes("left")) return "left";
+    if (text.includes("right")) return "right";
+    return "";
   }
 
   function extractCardStyle(objects) {
@@ -2512,13 +2534,12 @@
     if (type.includes("pie") || type.includes("donut")) {
       const stops = data?.kind === "category" ? pieGradientFromData(data.series, theme) : pieGradient(theme);
       const inner = type.includes("donut") ? `<span class="mini-pie-hole"></span>` : "";
-      const legend = data?.kind === "category" ? pieLegend(data.series, theme, data.format) : "";
-      return `
-        <div class="mini-pie-wrap">
-          <div class="mini-pie" style="background:conic-gradient(${stops})" aria-hidden="true">${inner}</div>
-          ${legend}
-        </div>
-      `;
+      const legendConf = visual.style?.legend || {};
+      const showLegend = legendConf.show !== false && data?.kind === "category";
+      const position = legendConf.position || "right";
+      const legend = showLegend ? pieLegend(data.series, theme, data.format) : "";
+      const pieHtml = `<div class="mini-pie" style="background:conic-gradient(${stops})" aria-hidden="true">${inner}</div>`;
+      return `<div class="mini-pie-wrap legend-${escapeAttribute(showLegend ? position : "none")}">${pieHtml}${legend}</div>`;
     }
 
     if (type.includes("bar") || type.includes("column") || type.includes("histogram") || type.includes("funnel") || type.includes("waterfall")) {

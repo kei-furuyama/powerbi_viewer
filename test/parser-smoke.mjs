@@ -426,6 +426,49 @@ assert.equal(rel.crossFilter, "bothDirections");
 
 console.log("filter & relationship smoke test passed");
 
+// --- 凡例(legend)のON/OFF・位置 ---
+function donutVisual(name, legendObj) {
+  return {
+    path: `L.Report/definition/pages/P/visuals/${name}/visual.json`,
+    text: JSON.stringify({
+      name,
+      position: { x: 0, y: 0, width: 300, height: 300, z: 0 },
+      visual: {
+        visualType: "donutChart",
+        objects: legendObj ? { legend: [{ properties: legendObj }] } : {},
+        query: { queryState: {
+          Category: { projections: [{ field: { Column: { Expression: { SourceRef: { Entity: "T" } }, Property: "k" } }, queryRef: "T.k", nativeQueryRef: "k" }] },
+          Y: { projections: [{ field: { Measure: { Expression: { SourceRef: { Entity: "T" } }, Property: "m" } }, queryRef: "T.m", nativeQueryRef: "m" }] },
+        } },
+      },
+    }),
+    size: 200,
+  };
+}
+
+const legendProject = analyzeProject(
+  [
+    { path: "L.pbip", text: JSON.stringify({ version: "1.0", artifacts: [{ report: { path: "L.Report" } }] }), size: 40 },
+    { path: "L.Report/definition/pages/pages.json", text: JSON.stringify({ pageOrder: ["P"] }), size: 30 },
+    { path: "L.Report/definition/pages/P/page.json", text: JSON.stringify({ name: "P", displayName: "P", width: 1280, height: 720 }), size: 60 },
+    donutVisual("donOff", { show: { expr: { Literal: { Value: "false" } } } }),
+    donutVisual("donBottom", { show: { expr: { Literal: { Value: "true" } } }, position: { expr: { Literal: { Value: "'BottomCenter'" } } } }),
+    donutVisual("donDefault", null),
+  ],
+  [],
+);
+
+const pageVisuals = legendProject.report.pages[0].visuals;
+const off = pageVisuals.find((v) => v.id === "donOff");
+const bottom = pageVisuals.find((v) => v.id === "donBottom");
+const def = pageVisuals.find((v) => v.id === "donDefault");
+assert.equal(off.style.legend.show, false, "legend show:false respected");
+assert.equal(bottom.style.legend.show, true, "legend show:true");
+assert.equal(bottom.style.legend.position, "bottom", "legend position parsed");
+assert.equal(def.style.legend.show, true, "legend defaults on when unspecified");
+
+console.log("legend smoke test passed");
+
 const legacyReportConfig = {
   name: "legacy_donut",
   layouts: [
