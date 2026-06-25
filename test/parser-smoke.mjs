@@ -249,6 +249,8 @@ const dataProject = analyzeProject(
         "\t\tformatString: #,0\"件\"",
         "\tmeasure 指摘金額計 = CALCULATE(SUM('案件'[金額億円]), '案件'[金額種別] = \"指摘金額\")",
         "\t\tformatString: #,0.0\"億円\"",
+        "\tmeasure 未使用メジャー = SUM('案件'[金額億円]) * 2",
+        "\t\tformatString: #,0.0",
         "\tcolumn 区分",
         "\t\tdataType: string",
         "\tcolumn 金額億円",
@@ -291,7 +293,47 @@ const groupB = barVisual.data.series.find((point) => point.label === "B");
 assert.equal(groupA.value, 2, "COUNTROWS per category group A");
 assert.equal(groupB.value, 1, "COUNTROWS per category group B");
 
+// --- 未使用メジャー検出 ---
+const measuresByName = Object.fromEntries(dataTable.measures.map((measure) => [measure.name, measure]));
+assert.equal(measuresByName["件数"].used, true, "件数 is bound to the bar visual");
+assert.equal(measuresByName["指摘金額計"].used, true, "指摘金額計 is bound to the card visual");
+assert.equal(measuresByName["未使用メジャー"].used, false, "未使用メジャー is referenced nowhere");
+assert.equal(dataProject.measureUsage.unused, 1, "one unused measure detected");
+
 console.log("inline-data measure smoke test passed");
+
+// --- DAXエンジンの対応度 ---
+const { evaluateDax } = globalThis.PBIPViewerParser;
+const salesTable = {
+  name: "Sales",
+  columns: [{ name: "数量" }, { name: "単価" }, { name: "地域" }, { name: "区分" }],
+  records: [
+    { 数量: 2, 単価: 100, 地域: "東", 区分: "A" },
+    { 数量: 3, 単価: 200, 地域: "西", 区分: "A" },
+    { 数量: 5, 単価: 50, 地域: "東", 区分: "B" },
+  ],
+  measures: new Map(),
+};
+salesTable.measures.set("合計金額", { name: "合計金額", expression: "SUMX('Sales', 'Sales'[数量] * 'Sales'[単価])" });
+salesTable.measures.set("件数", { name: "件数", expression: "COUNTROWS('Sales')" });
+const model = new Map([["Sales", salesTable]]);
+const evalIn = (expr) => evaluateDax(expr, salesTable.records, salesTable, model);
+
+assert.equal(evalIn("SUM('Sales'[数量])"), 10, "SUM");
+assert.equal(evalIn("SUMX('Sales', 'Sales'[数量] * 'Sales'[単価])"), 200 + 600 + 250, "SUMX iterator with arithmetic");
+assert.equal(evalIn("AVERAGE('Sales'[単価])"), 350 / 3, "AVERAGE");
+assert.equal(evalIn("DISTINCTCOUNT('Sales'[地域])"), 2, "DISTINCTCOUNT");
+assert.equal(evalIn("CALCULATE(SUM('Sales'[数量]), 'Sales'[区分] = \"A\")"), 5, "CALCULATE simple filter");
+assert.equal(evalIn("CALCULATE(SUM('Sales'[数量]), FILTER('Sales', 'Sales'[単価] >= 100))"), 5, "CALCULATE + FILTER");
+assert.equal(evalIn("CALCULATE(COUNTROWS('Sales'), 'Sales'[区分] = \"A\" && 'Sales'[地域] = \"東\")"), 1, "CALCULATE && predicate");
+assert.equal(evalIn("DIVIDE(SUM('Sales'[数量]), COUNTROWS('Sales'))"), 10 / 3, "DIVIDE");
+assert.equal(evalIn("DIVIDE(1, 0, -1)"), -1, "DIVIDE by zero alternate");
+assert.equal(evalIn("[合計金額] / [件数]"), 1050 / 3, "measure references + arithmetic");
+assert.equal(evalIn("VAR x = SUM('Sales'[数量]) RETURN x * 2"), 20, "VAR/RETURN");
+assert.equal(evalIn("IF(SUM('Sales'[数量]) > 5, \"多\", \"少\")"), "多", "IF");
+assert.equal(evalIn("ROUND(DIVIDE(10, 3), 2)"), 3.33, "ROUND");
+
+console.log("dax engine smoke test passed");
 
 const legacyReportConfig = {
   name: "legacy_donut",

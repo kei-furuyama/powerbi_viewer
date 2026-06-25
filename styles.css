@@ -401,6 +401,23 @@ select {
   border: 1px solid var(--line-strong);
   box-shadow: var(--shadow);
   overflow: hidden;
+  font-family: "Segoe UI", "Segoe UI Web (West European)", -apple-system, "Hiragino Kaku Gothic ProN", "Yu Gothic UI", Meiryo, sans-serif;
+}
+
+.card-accent {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  z-index: 4;
+  pointer-events: none;
+}
+
+.mini-card {
+  width: 100%;
+  display: grid;
+  gap: 2px;
+  align-content: center;
+  padding-left: 2px;
 }
 
 .visual-box {
@@ -911,6 +928,88 @@ td code,
 .field-kind {
   color: var(--muted);
   white-space: nowrap;
+}
+
+.model-summary {
+  grid-column: 1 / -1;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-soft);
+  font-size: 0.86rem;
+}
+
+.model-table .panel-title {
+  padding: 10px 12px 0;
+}
+
+.measure-list {
+  padding: 8px 12px 4px;
+  display: grid;
+  gap: 8px;
+}
+
+.measure-row {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 8px 9px;
+  background: var(--surface-soft);
+}
+
+.measure-row.unused {
+  border-color: var(--amber);
+  background: rgba(214, 114, 22, 0.06);
+}
+
+.measure-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+
+.measure-name {
+  font-weight: 600;
+  font-size: 0.86rem;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.measure-tags {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+
+.tag {
+  font-size: 0.68rem;
+  padding: 2px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  white-space: nowrap;
+}
+
+.tag.warn {
+  border-color: var(--amber);
+  color: var(--amber);
+  background: rgba(214, 114, 22, 0.1);
+}
+
+.measure-dax {
+  margin: 7px 0 0;
+  padding: 8px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  overflow-x: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.74rem;
+  line-height: 1.45;
+  white-space: pre;
+  color: #2a2a2a;
 }
 
 .issue {

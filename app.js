@@ -25,8 +25,6 @@
   function bindElements() {
     Object.assign(els, {
       folderInput: document.getElementById("folderInput"),
-      fileInput: document.getElementById("fileInput"),
-      exportButton: document.getElementById("exportButton"),
       statusText: document.getElementById("statusText"),
       dropZone: document.getElementById("dropZone"),
       emptyState: document.getElementById("emptyState"),
@@ -56,13 +54,6 @@
       handleFiles(event.target.files);
       event.target.value = "";
     });
-
-    els.fileInput.addEventListener("change", (event) => {
-      handleFiles(event.target.files);
-      event.target.value = "";
-    });
-
-    els.exportButton.addEventListener("click", exportSummary);
 
     els.pageSelect.addEventListener("change", (event) => {
       state.selectedPageId = event.target.value;
@@ -266,6 +257,7 @@
     const semantic = buildSemantic(normalizedEntries, jsonByPath);
     const dataModel = buildDataModel(semantic);
     hydrateVisualData(report, dataModel);
+    const measureUsage = computeMeasureUsage(report, semantic);
     const pbipFiles = normalizedEntries.filter((entry) => entry.path.toLowerCase().endsWith(".pbip"));
 
     if (!pbipFiles.length) {
@@ -323,6 +315,17 @@
       });
     }
 
+    if (measureUsage.unused > 0) {
+      const names = semantic.tables
+        .flatMap((table) => table.measures.filter((measure) => measure.used === false).map((measure) => `${table.name}[${measure.name}]`))
+        .slice(0, 12);
+      issues.push({
+        level: "warning",
+        title: `未使用のメジャーが ${measureUsage.unused} 件あります`,
+        detail: `${names.join(" / ")}${measureUsage.unused > names.length ? " ..." : ""}`,
+      });
+    }
+
     return {
       uploadedAt: new Date().toISOString(),
       entries: normalizedEntries.sort((a, b) => a.path.localeCompare(b.path)),
@@ -330,6 +333,7 @@
       report,
       semantic,
       dataModel: { loadedTables: dataModel.loadedTables },
+      measureUsage,
       issues,
     };
   }
@@ -473,7 +477,23 @@
     }
 
     const dataColors = palettes.find((colors) => colors.length) || DEFAULT_THEME_COLORS;
-    return { dataColors, isDefault: dataColors === DEFAULT_THEME_COLORS };
+    const themeFiles = [reportJson?.themeCollection?.customTheme, reportJson?.themeCollection?.baseTheme];
+    let foreground = "";
+    let background = "";
+    for (const [path, json] of jsonByPath.entries()) {
+      const lower = path.toLowerCase();
+      if (lower.includes("theme") || lower.includes("/registeredresources/") || lower.includes("/staticresources/")) {
+        foreground = foreground || normalizeColor(json?.foreground);
+        background = background || normalizeColor(json?.background);
+      }
+    }
+    void themeFiles;
+    return {
+      dataColors,
+      foreground: foreground || "#252423",
+      background: background || "#FFFFFF",
+      isDefault: dataColors === DEFAULT_THEME_COLORS,
+    };
   }
 
   function readThemeColors(themeJson) {
@@ -752,7 +772,22 @@
         show: readExprBool(borderProps?.show) === true,
         radius: readExprNumber(borderProps?.radius),
       },
+      card: extractCardStyle(objects),
       dataColors: extractDataColors(objects),
+    };
+  }
+
+  function extractCardStyle(objects) {
+    const accentProps = firstObjectProps(objects.accentBar);
+    const valueProps = firstObjectProps(objects.value) || firstObjectProps(objects.values) || firstObjectProps(objects.dataLabels);
+    const labelProps = firstObjectProps(objects.label) || firstObjectProps(objects.categoryLabels);
+    return {
+      accentColor: readExprColor(accentProps?.color),
+      accentShow: Boolean(accentProps) && readExprBool(accentProps?.show) !== false,
+      accentPosition: readExprString(accentProps?.position) || "Left",
+      accentWidth: readExprNumber(accentProps?.width),
+      valueColor: readExprColor(valueProps?.fontColor),
+      labelColor: readExprColor(labelProps?.fontColor),
     };
   }
 
@@ -1413,62 +1448,386 @@
     }
   }
 
-  function evaluateDax(expression, records, table) {
-    if (!expression) return null;
-    let body = String(expression).trim();
+  // === DAX式エンジン(トークナイザ + 再帰下降パーサ + 評価器) =========
 
-    const calc = body.match(/^CALCULATE\s*\(([\s\S]*)\)$/i);
-    let rows = records;
-    if (calc) {
-      const args = splitTopLevel(calc[1]);
-      body = args[0].trim();
-      for (const filterText of args.slice(1)) {
-        const filter = parseDaxFilter(filterText, table);
-        if (filter) rows = rows.filter((record) => matchDaxFilter(record, filter));
+  function tokenizeDax(input) {
+    const tokens = [];
+    const text = String(input);
+    const n = text.length;
+    const identStart = /[A-Za-z_À-￿]/;
+    const identChar = /[A-Za-z0-9_À-￿]/;
+    let i = 0;
+    while (i < n) {
+      const c = text[i];
+      if (/\s/.test(c)) { i += 1; continue; }
+      if (c === '"') {
+        let j = i + 1; let s = "";
+        while (j < n) { if (text[j] === '"') { if (text[j + 1] === '"') { s += '"'; j += 2; continue; } j += 1; break; } s += text[j++]; }
+        tokens.push({ t: "str", v: s }); i = j; continue;
+      }
+      if (c === "'") {
+        let j = i + 1; let s = "";
+        while (j < n) { if (text[j] === "'") { if (text[j + 1] === "'") { s += "'"; j += 2; continue; } j += 1; break; } s += text[j++]; }
+        tokens.push({ t: "tbl", v: s }); i = j; continue;
+      }
+      if (c === "[") {
+        let j = i + 1; let s = "";
+        while (j < n && text[j] !== "]") s += text[j++];
+        tokens.push({ t: "col", v: s }); i = j + 1; continue;
+      }
+      if (/[0-9]/.test(c) || (c === "." && /[0-9]/.test(text[i + 1] || ""))) {
+        let j = i; while (j < n && /[0-9.]/.test(text[j])) j += 1;
+        tokens.push({ t: "num", v: Number(text.slice(i, j)) }); i = j; continue;
+      }
+      const two = text.slice(i, i + 2);
+      if (["<>", "<=", ">=", "&&", "||"].includes(two)) { tokens.push({ t: "op", v: two }); i += 2; continue; }
+      if ("+-*/(),=<>&".includes(c)) { tokens.push({ t: "op", v: c }); i += 1; continue; }
+      if (identStart.test(c)) {
+        let j = i; while (j < n && identChar.test(text[j])) j += 1;
+        tokens.push({ t: "id", v: text.slice(i, j) }); i = j; continue;
+      }
+      i += 1;
+    }
+    return tokens;
+  }
+
+  const DAX_PRECEDENCE = {
+    "||": 1, "&&": 2,
+    "=": 3, "<>": 3, "<": 3, ">": 3, "<=": 3, ">=": 3,
+    "&": 4, "+": 4, "-": 4,
+    "*": 5, "/": 5,
+  };
+
+  function parseDax(tokens) {
+    let pos = 0;
+    const peek = () => tokens[pos];
+    const advance = () => tokens[pos++];
+
+    function parseExpr(minPrec = 0) {
+      let left = parseUnary();
+      while (true) {
+        const tok = peek();
+        if (!tok || tok.t !== "op") break;
+        const prec = DAX_PRECEDENCE[tok.v];
+        if (prec == null || prec < minPrec) break;
+        advance();
+        const right = parseExpr(prec + 1);
+        left = { type: "bin", op: tok.v, l: left, r: right };
+      }
+      return left;
+    }
+
+    function parseUnary() {
+      const tok = peek();
+      if (tok && tok.t === "op" && tok.v === "-") { advance(); return { type: "unary", e: parseUnary() }; }
+      if (tok && tok.t === "op" && tok.v === "+") { advance(); return parseUnary(); }
+      return parsePrimary();
+    }
+
+    function parseArgs() {
+      const args = [];
+      if (peek() && peek().t === "op" && peek().v === ")") { advance(); return args; }
+      while (true) {
+        args.push(parseExpr());
+        const tok = peek();
+        if (tok && tok.t === "op" && tok.v === ",") { advance(); continue; }
+        break;
+      }
+      if (peek() && peek().t === "op" && peek().v === ")") advance();
+      return args;
+    }
+
+    function parsePrimary() {
+      const tok = advance();
+      if (!tok) return { type: "num", v: 0 };
+      if (tok.t === "num") return { type: "num", v: tok.v };
+      if (tok.t === "str") return { type: "str", v: tok.v };
+      if (tok.t === "col") return { type: "ref", name: tok.v };
+      if (tok.t === "tbl") {
+        if (peek() && peek().t === "col") { const col = advance(); return { type: "col", table: tok.v, name: col.v }; }
+        return { type: "tableName", name: tok.v };
+      }
+      if (tok.t === "id") {
+        const nx = peek();
+        if (nx && nx.t === "op" && nx.v === "(") { advance(); return { type: "call", name: tok.v.toUpperCase(), args: parseArgs() }; }
+        if (nx && nx.t === "col") { const col = advance(); return { type: "col", table: tok.v, name: col.v }; }
+        return { type: "name", name: tok.v };
+      }
+      if (tok.t === "op" && tok.v === "(") {
+        const expr = parseExpr();
+        if (peek() && peek().t === "op" && peek().v === ")") advance();
+        return expr;
+      }
+      return { type: "num", v: 0 };
+    }
+
+    return parseExpr();
+  }
+
+  function stripVars(expression) {
+    let rest = String(expression).trim();
+    const vars = [];
+    const keywordAt = (text) => {
+      let depth = 0; let inStr = false; let strCh = "";
+      for (let i = 0; i < text.length; i += 1) {
+        const c = text[i];
+        if (inStr) { if (c === strCh) inStr = false; continue; }
+        if (c === '"' || c === "'") { inStr = true; strCh = c; continue; }
+        if (c === "(" || c === "[") depth += 1;
+        else if (c === ")" || c === "]") depth -= 1;
+        if (depth === 0) {
+          const ahead = text.slice(i);
+          if (/^\bVAR\b/i.test(ahead) && (i === 0 || /\s/.test(text[i - 1]))) return { kw: "VAR", index: i };
+          if (/^\bRETURN\b/i.test(ahead) && (i === 0 || /\s/.test(text[i - 1]))) return { kw: "RETURN", index: i };
+        }
+      }
+      return null;
+    };
+
+    while (/^VAR\s/i.test(rest)) {
+      const m = rest.match(/^VAR\s+([A-Za-z_À-￿][\wÀ-￿]*)\s*=\s*/i);
+      if (!m) break;
+      const after = rest.slice(m[0].length);
+      const next = keywordAt(after);
+      const end = next ? next.index : after.length;
+      vars.push({ name: m[1], expr: after.slice(0, end).trim() });
+      rest = after.slice(end).trim();
+    }
+    const ret = rest.match(/^RETURN\s+/i);
+    if (ret) rest = rest.slice(ret[0].length).trim();
+    return { vars, body: rest };
+  }
+
+  function evaluateDax(expression, records, table, model) {
+    if (!expression) return null;
+    try {
+      return evaluateMeasureExpression(String(expression), { table, model, rows: records, row: null, vars: {}, stack: new Set() });
+    } catch {
+      return null;
+    }
+  }
+
+  function evaluateMeasureExpression(expression, ctx) {
+    const { vars, body } = stripVars(expression);
+    const scope = { ...ctx.vars };
+    const localCtx = { ...ctx, vars: scope };
+    for (const variable of vars) {
+      scope[variable.name] = evalDaxNode(parseDax(tokenizeDax(variable.expr)), localCtx);
+    }
+    return evalDaxNode(parseDax(tokenizeDax(body)), localCtx);
+  }
+
+  function toNum(value) {
+    if (value == null || value === "" || value === false) return 0;
+    if (value === true) return 1;
+    const number = Number(value);
+    return Number.isFinite(number) ? number : 0;
+  }
+
+  function isBlank(value) {
+    return value == null || value === "";
+  }
+
+  function evalDaxNode(node, ctx) {
+    if (!node) return null;
+    switch (node.type) {
+      case "num": return node.v;
+      case "str": return node.v;
+      case "unary": return -toNum(evalDaxNode(node.e, ctx));
+      case "col": return ctx.row ? ctx.row[resolveColumn(ctx.table, node.name)] ?? null : null;
+      case "ref": return evalDaxRef(node.name, ctx);
+      case "name": return evalDaxName(node.name, ctx);
+      case "tableName": return null;
+      case "bin": return evalDaxBin(node, ctx);
+      case "call": return evalDaxCall(node, ctx);
+      default: return null;
+    }
+  }
+
+  function evalDaxRef(name, ctx) {
+    if (ctx.vars && name in ctx.vars) return ctx.vars[name];
+    if (ctx.table?.measures?.has(name)) {
+      const measure = ctx.table.measures.get(name);
+      if (ctx.stack.has(name)) return null;
+      ctx.stack.add(name);
+      const result = evaluateMeasureExpression(measure.expression, { ...ctx, row: null, vars: {} });
+      ctx.stack.delete(name);
+      return result;
+    }
+    if (ctx.row) {
+      const column = resolveColumn(ctx.table, name);
+      if (column) return ctx.row[column] ?? null;
+    }
+    return null;
+  }
+
+  function evalDaxName(name, ctx) {
+    if (ctx.vars && name in ctx.vars) return ctx.vars[name];
+    if (/^TRUE$/i.test(name)) return true;
+    if (/^FALSE$/i.test(name)) return false;
+    if (/^BLANK$/i.test(name)) return null;
+    return null;
+  }
+
+  function evalDaxBin(node, ctx) {
+    const op = node.op;
+    if (op === "&&") return truthy(evalDaxNode(node.l, ctx)) && truthy(evalDaxNode(node.r, ctx));
+    if (op === "||") return truthy(evalDaxNode(node.l, ctx)) || truthy(evalDaxNode(node.r, ctx));
+    const left = evalDaxNode(node.l, ctx);
+    const right = evalDaxNode(node.r, ctx);
+    switch (op) {
+      case "+": return toNum(left) + toNum(right);
+      case "-": return toNum(left) - toNum(right);
+      case "*": return toNum(left) * toNum(right);
+      case "/": return toNum(right) === 0 ? null : toNum(left) / toNum(right);
+      case "&": return `${left ?? ""}${right ?? ""}`;
+      case "=": return compareValues(left, right) === 0;
+      case "<>": return compareValues(left, right) !== 0;
+      case ">": return compareValues(left, right) > 0;
+      case "<": return compareValues(left, right) < 0;
+      case ">=": return compareValues(left, right) >= 0;
+      case "<=": return compareValues(left, right) <= 0;
+      default: return null;
+    }
+  }
+
+  function compareValues(a, b) {
+    if (typeof a === "number" || typeof b === "number") {
+      const na = toNum(a); const nb = toNum(b);
+      return na === nb ? 0 : na < nb ? -1 : 1;
+    }
+    const sa = String(a ?? ""); const sb = String(b ?? "");
+    return sa === sb ? 0 : sa < sb ? -1 : 1;
+  }
+
+  function truthy(value) {
+    if (value === true) return true;
+    if (value === false || value == null) return false;
+    if (typeof value === "number") return value !== 0;
+    if (value === "") return false;
+    return true;
+  }
+
+  const DAX_AGGREGATIONS = new Set(["SUM", "AVERAGE", "MIN", "MAX", "COUNT", "COUNTA", "COUNTBLANK", "DISTINCTCOUNT", "PRODUCT"]);
+  const DAX_ITERATORS = new Set(["SUMX", "AVERAGEX", "MINX", "MAXX", "COUNTX", "COUNTAX", "PRODUCTX"]);
+
+  function resolveTableArg(node, ctx) {
+    if (!node) return ctx.rows;
+    if (node.type === "call") {
+      const name = node.name;
+      if (name === "FILTER") {
+        const base = resolveTableArg(node.args[0], ctx);
+        return base.filter((row) => truthy(evalDaxNode(node.args[1], { ...ctx, row, rows: base })));
+      }
+      if (name === "ALL" || name === "ALLSELECTED" || name === "VALUES" || name === "DISTINCT") {
+        return ctx.table?.records || ctx.rows;
       }
     }
-
-    const agg = body.match(/^(COUNTROWS|DISTINCTCOUNT|SUM|MIN|MAX|AVERAGE)\s*\(([\s\S]*)\)$/i);
-    if (!agg) return null;
-    const func = agg[1].toUpperCase();
-    if (func === "COUNTROWS") return rows.length;
-
-    const columnName = resolveColumn(table, parseColumnRef(agg[2]));
-    if (!columnName) return null;
-    return aggregate(rows, columnName, func === "DISTINCTCOUNT" ? "distinctcount" : func);
-  }
-
-  function parseColumnRef(text) {
-    const match = String(text).match(/\[([^\]]+)\]/);
-    if (match) return match[1];
-    return String(text).replace(/['"]/g, "").trim();
-  }
-
-  function parseDaxFilter(text, table) {
-    const match = String(text).match(/\[([^\]]+)\]\s*(=|<>|>=|<=|>|<)\s*(.+)$/);
-    if (!match) return null;
-    const column = resolveColumn(table, match[1]);
-    if (!column) return null;
-    let rawValue = match[3].trim();
-    let value;
-    if (/^".*"$/.test(rawValue)) value = rawValue.slice(1, -1).replace(/""/g, '"');
-    else if (/^-?\d+(\.\d+)?$/.test(rawValue)) value = Number(rawValue);
-    else value = rawValue.replace(/^['"]|['"]$/g, "");
-    return { column, op: match[2], value };
-  }
-
-  function matchDaxFilter(record, filter) {
-    const cell = record[filter.column];
-    const left = typeof filter.value === "number" ? Number(cell) : String(cell ?? "");
-    switch (filter.op) {
-      case "=": return left == filter.value;
-      case "<>": return left != filter.value;
-      case ">": return left > filter.value;
-      case "<": return left < filter.value;
-      case ">=": return left >= filter.value;
-      case "<=": return left <= filter.value;
-      default: return true;
+    if (node.type === "name" || node.type === "tableName") {
+      if (ctx.model) {
+        const target = ctx.model.get(node.name) || ctx.model.get(normalizeName(node.name));
+        if (target && target.name !== ctx.table?.name) return target.records;
+      }
+      return ctx.rows;
     }
+    return ctx.rows;
+  }
+
+  function aggregateValues(func, values) {
+    const present = values.filter((value) => !isBlank(value));
+    const numbers = present.map(toNum);
+    switch (func) {
+      case "COUNT": return present.filter((value) => Number.isFinite(Number(value))).length;
+      case "COUNTA": return present.length;
+      case "COUNTBLANK": return values.length - present.length;
+      case "DISTINCTCOUNT": return new Set(present.map((value) => String(value))).size;
+      case "AVERAGE": return numbers.length ? numbers.reduce((a, b) => a + b, 0) / numbers.length : null;
+      case "MIN": return numbers.length ? Math.min(...numbers) : null;
+      case "MAX": return numbers.length ? Math.max(...numbers) : null;
+      case "PRODUCT": return numbers.reduce((a, b) => a * b, 1);
+      default: return numbers.reduce((a, b) => a + b, 0);
+    }
+  }
+
+  function evalDaxCall(node, ctx) {
+    const name = node.name;
+    const args = node.args || [];
+
+    if (name === "CALCULATE") {
+      let rows = ctx.rows;
+      for (const filter of args.slice(1)) rows = applyCalcFilter(rows, filter, ctx);
+      return evalDaxNode(args[0], { ...ctx, rows, row: null });
+    }
+
+    if (name === "COUNTROWS") {
+      const rows = args.length ? resolveTableArg(args[0], ctx) : ctx.rows;
+      return rows.length;
+    }
+
+    // MIN/MAX は2引数のスカラー形(行コンテキスト不問)を集計形より優先
+    if ((name === "MIN" || name === "MAX") && args.length === 2) {
+      const a = toNum(evalDaxNode(args[0], ctx));
+      const b = toNum(evalDaxNode(args[1], ctx));
+      return name === "MIN" ? Math.min(a, b) : Math.max(a, b);
+    }
+
+    if (DAX_AGGREGATIONS.has(name)) {
+      const values = ctx.rows.map((row) => evalDaxNode(args[0], { ...ctx, row }));
+      return aggregateValues(name, values);
+    }
+
+    if (DAX_ITERATORS.has(name)) {
+      const rows = resolveTableArg(args[0], ctx);
+      const values = rows.map((row) => evalDaxNode(args[1], { ...ctx, row, rows }));
+      const base = name.replace(/X$/, "");
+      return aggregateValues(base === "COUNTA" ? "COUNTA" : base, values);
+    }
+
+    if (name === "DIVIDE") {
+      const num = toNum(evalDaxNode(args[0], ctx));
+      const den = toNum(evalDaxNode(args[1], ctx));
+      if (den === 0) return args[2] ? evalDaxNode(args[2], ctx) : null;
+      return num / den;
+    }
+
+    if (name === "IF") {
+      return truthy(evalDaxNode(args[0], ctx)) ? evalDaxNode(args[1], ctx) : (args[2] ? evalDaxNode(args[2], ctx) : null);
+    }
+
+    if (name === "IFERROR") {
+      const value = evalDaxNode(args[0], ctx);
+      return value == null ? evalDaxNode(args[1], ctx) : value;
+    }
+
+    if (name === "COALESCE") {
+      for (const arg of args) { const value = evalDaxNode(arg, ctx); if (!isBlank(value)) return value; }
+      return null;
+    }
+
+    if (name === "BLANK") return null;
+    if (name === "TRUE") return true;
+    if (name === "FALSE") return false;
+
+    if (name === "ABS") return Math.abs(toNum(evalDaxNode(args[0], ctx)));
+    if (name === "INT") return Math.trunc(toNum(evalDaxNode(args[0], ctx)));
+    if (name === "ROUND") return roundHalf(toNum(evalDaxNode(args[0], ctx)), toNum(evalDaxNode(args[1], ctx)));
+    if (name === "ROUNDUP") { const f = 10 ** toNum(evalDaxNode(args[1], ctx)); return Math.ceil(toNum(evalDaxNode(args[0], ctx)) * f) / f; }
+    if (name === "ROUNDDOWN") { const f = 10 ** toNum(evalDaxNode(args[1], ctx)); return Math.floor(toNum(evalDaxNode(args[0], ctx)) * f) / f; }
+
+    return null;
+  }
+
+  function roundHalf(value, decimals) {
+    const factor = 10 ** decimals;
+    return Math.round(value * factor) / factor;
+  }
+
+  function applyCalcFilter(rows, node, ctx) {
+    if (node.type === "call" && (node.name === "FILTER" || node.name === "ALL" || node.name === "VALUES" || node.name === "DISTINCT" || node.name === "ALLSELECTED")) {
+      return resolveTableArg(node, { ...ctx, rows });
+    }
+    // ブール述語(列 = 値 など)を行フィルタとして適用
+    return rows.filter((row) => truthy(evalDaxNode(node, { ...ctx, row, rows })));
   }
 
   function formatMeasureValue(value, formatString) {
@@ -1518,6 +1877,53 @@
     }
   }
 
+  function computeMeasureUsage(report, semantic) {
+    const used = new Set();
+    const mark = (table, name) => {
+      if (!name) return;
+      used.add(normalizeName(name));
+      if (table) used.add(`${normalizeName(table)}|${normalizeName(name)}`);
+    };
+
+    // ビジュアルのロール/フィールドから参照を収集
+    for (const visual of report.visuals) {
+      for (const role of visual.roles || []) {
+        for (const field of role.fields) {
+          if (field.kind === "measure" || field.kind === "aggregation") mark(field.table, field.name);
+        }
+      }
+      for (const field of visual.fields || []) {
+        if (field.kind === "measure") mark(field.table, field.name);
+      }
+    }
+
+    const allNames = new Set();
+    for (const table of semantic.tables) {
+      for (const measure of table.measures) allNames.add(measure.name);
+    }
+
+    // 他メジャーのDAXから参照されるメジャーも「使用中」とみなす
+    for (const table of semantic.tables) {
+      for (const measure of table.measures) {
+        const refs = String(measure.expression || "").match(/\[([^\]]+)\]/g) || [];
+        for (const ref of refs) {
+          const name = ref.slice(1, -1);
+          if (name !== measure.name && allNames.has(name)) mark(null, name);
+        }
+      }
+    }
+
+    let unused = 0;
+    for (const table of semantic.tables) {
+      for (const measure of table.measures) {
+        const isUsed = used.has(`${normalizeName(table.name)}|${normalizeName(measure.name)}`) || used.has(normalizeName(measure.name));
+        measure.used = isUsed;
+        if (!isUsed) unused += 1;
+      }
+    }
+    return { unused };
+  }
+
   function roleFieldsByKind(visual, kind) {
     const result = [];
     for (const role of visual.roles || []) {
@@ -1540,11 +1946,11 @@
     return null;
   }
 
-  function evaluateField(field, records, table) {
+  function evaluateField(field, records, table, model) {
     if (!field) return null;
     if (field.kind === "measure") {
       const measure = table.measures.get(field.name);
-      if (measure) return { value: evaluateDax(measure.expression, records, table), format: measure.formatString };
+      if (measure) return { value: evaluateDax(measure.expression, records, table, model), format: measure.formatString };
       return null;
     }
     const columnName = resolveColumn(table, field.name);
@@ -1560,6 +1966,7 @@
     const type = visual.type.toLowerCase();
     const table = resolveTableFor([...values, ...categories], dataModel);
     if (!table) return null;
+    const model = dataModel.byName;
 
     const valueField = values[0];
     const categoryField = categories[0];
@@ -1590,7 +1997,7 @@
 
     // カード / KPI(カテゴリなし)
     if ((type.includes("card") || type.includes("kpi") || type.includes("gauge") || type.includes("multirow")) || (!categoryColumn && valueField)) {
-      const evaluated = valueField ? evaluateField(valueField, table.records, table) : null;
+      const evaluated = valueField ? evaluateField(valueField, table.records, table, model) : null;
       if (!evaluated) return null;
       return { kind: "card", value: evaluated.value, text: formatMeasureValue(evaluated.value, evaluated.format), label: valueField.display };
     }
@@ -1604,7 +2011,7 @@
         groups.get(label).push(record);
       }
       let series = [...groups.entries()].map(([label, records]) => {
-        const evaluated = evaluateField(valueField, records, table);
+        const evaluated = evaluateField(valueField, records, table, model);
         return { label, value: Number(evaluated?.value) || 0, format: evaluated?.format || "" };
       });
       if (!type.includes("line") && !type.includes("area")) {
@@ -1640,7 +2047,6 @@
     renderModelExplorer();
     renderFileTable();
     renderIssues();
-    els.exportButton.disabled = !state.project;
   }
 
   function renderTabs() {
@@ -1737,6 +2143,7 @@
     els.canvasMeta.textContent = `${Math.round(page.width)} x ${Math.round(page.height)} / ${page.visuals.length} visuals`;
     els.reportCanvas.style.aspectRatio = `${page.width} / ${page.height}`;
     els.reportCanvas.style.background = page.background?.color || "";
+    els.reportCanvas.style.color = state.project?.report?.theme?.foreground || "";
 
     const theme = getTheme();
 
@@ -1757,14 +2164,25 @@
       if (style.border?.show && style.border.color) box.style.borderColor = style.border.color;
       if (Number.isFinite(style.border?.radius)) box.style.borderRadius = `${style.border.radius}px`;
 
+
       const showTitle = visual.hasExplicitTitle;
       const titleStyle = [
         style.title?.color ? `color:${style.title.color}` : "",
         style.title?.align ? `text-align:${cssAlign(style.title.align)}` : "",
       ].filter(Boolean).join(";");
 
+      // カードのアクセントバー(Power BIの左帯)を再現
+      const card = style.card;
+      let accentHtml = "";
+      if (card?.accentShow && card.accentColor) {
+        const width = Number.isFinite(card.accentWidth) ? Math.min(8, Math.max(2, card.accentWidth)) : 4;
+        const sideStyle = /right/i.test(card.accentPosition) ? `right:0` : `left:0`;
+        accentHtml = `<span class="card-accent" style="${sideStyle};width:${width}px;background:${escapeAttribute(card.accentColor)}"></span>`;
+      }
+
       box.title = `${visual.typeLabel} / ${visual.fields.length} fields`;
       box.innerHTML = `
+        ${accentHtml}
         ${showTitle ? `<div class="visual-title" style="${titleStyle}">${escapeHtml(visual.title)}</div>` : ""}
         <div class="visual-body">${renderVisualPreview(visual, theme)}</div>
       `;
@@ -1826,10 +2244,13 @@
     if (type.includes("card") || type.includes("kpi") || type.includes("gauge") || type.includes("multirowcard")) {
       const valueText = data?.kind === "card" ? data.text : "—";
       const label = (data?.kind === "card" && data.label) || valueLabel;
+      const card = visual.style?.card || {};
+      const valueStyle = card.valueColor ? `color:${escapeAttribute(card.valueColor)}` : "";
+      const labelStyle = card.labelColor ? `color:${escapeAttribute(card.labelColor)}` : "";
       return `
-        <div>
-          <div class="mini-card-value">${escapeHtml(valueText)}</div>
-          <div class="mini-card-label">${escapeHtml(label)}</div>
+        <div class="mini-card">
+          <div class="mini-card-value" style="${valueStyle}">${escapeHtml(valueText)}</div>
+          <div class="mini-card-label" style="${labelStyle}">${escapeHtml(label)}</div>
         </div>
       `;
     }
@@ -2106,47 +2527,71 @@
       return;
     }
 
-    els.modelExplorer.innerHTML = tables
+    const totalUnused = tables.reduce(
+      (sum, table) => sum + table.measures.filter((measure) => measure.used === false).length,
+      0,
+    );
+
+    const summary = totalUnused
+      ? `<div class="model-summary">未使用のメジャー: <b>${totalUnused}</b> 件（ビジュアル・他メジャーから参照されていません）</div>`
+      : `<div class="model-summary">すべてのメジャーがどこかで使用されています</div>`;
+
+    els.modelExplorer.innerHTML = summary + tables
       .map((table) => {
-        const rows = [
-          ...table.measures.slice(0, 7).map((measure) => ({
-            name: measure.name,
-            kind: "measure",
-            meta: measure.formatString || "",
-          })),
-          ...table.columns.slice(0, 10).map((column) => ({
-            name: column.name,
-            kind: "column",
-            meta: column.dataType || "",
-          })),
-        ];
+        const measureRows = table.measures
+          .map((measure) => {
+            const unused = measure.used === false;
+            const meta = [measure.formatString].filter(Boolean).map(escapeHtml).join(" · ");
+            return `
+              <div class="measure-row ${unused ? "unused" : ""}">
+                <div class="measure-head">
+                  <span class="measure-name">${escapeHtml(measure.name)}</span>
+                  <span class="measure-tags">
+                    ${unused ? `<span class="tag warn">未使用</span>` : ""}
+                    ${meta ? `<span class="field-kind">${meta}</span>` : ""}
+                  </span>
+                </div>
+                ${measure.expression ? `<pre class="measure-dax"><code>${escapeHtml(formatDaxDisplay(measure.expression))}</code></pre>` : ""}
+              </div>
+            `;
+          })
+          .join("");
+
+        const columnRows = table.columns
+          .slice(0, 30)
+          .map(
+            (column) => `
+              <div class="field-row">
+                <span>${escapeHtml(column.name)}</span>
+                <span class="field-kind">column${column.dataType ? ` · ${escapeHtml(column.dataType)}` : ""}</span>
+              </div>
+            `,
+          )
+          .join("");
+
+        const unusedCount = table.measures.filter((measure) => measure.used === false).length;
 
         return `
           <article class="model-table">
             <div class="model-head">
               <h3>${escapeHtml(table.name)}</h3>
-              <span class="model-count">${table.columns.length} columns / ${table.measures.length} measures</span>
+              <span class="model-count">${table.columns.length} columns / ${table.measures.length} measures${unusedCount ? ` · 未使用 ${unusedCount}` : ""}</span>
             </div>
-            <div class="field-list">
-              ${
-                rows.length
-                  ? rows
-                      .map(
-                        (row) => `
-                          <div class="field-row">
-                            <span>${escapeHtml(row.name)}</span>
-                            <span class="field-kind">${escapeHtml(row.kind)}${row.meta ? ` · ${escapeHtml(row.meta)}` : ""}</span>
-                          </div>
-                        `,
-                      )
-                      .join("")
-                  : '<span class="muted">列またはメジャーを検出できませんでした</span>'
-              }
-            </div>
+            ${table.measures.length ? `<div class="panel-title">メジャー (DAX)</div><div class="measure-list">${measureRows}</div>` : ""}
+            ${table.columns.length ? `<div class="panel-title">列</div><div class="field-list">${columnRows}</div>` : '<span class="muted">列を検出できませんでした</span>'}
           </article>
         `;
       })
       .join("");
+  }
+
+  function formatDaxDisplay(expression) {
+    // 主要キーワードの前で改行し、読みやすく整形(簡易)
+    return String(expression)
+      .replace(/\s+/g, " ")
+      .replace(/\s*(VAR |RETURN |CALCULATE\(|FILTER\(|SUMX\(|AVERAGEX\()/gi, "\n$1")
+      .replace(/,\s*(?![^()]*\))/g, ",\n  ")
+      .trim();
   }
 
   function renderFileTable() {
@@ -2204,61 +2649,6 @@
         `,
       )
       .join("");
-  }
-
-  function exportSummary() {
-    if (!state.project) return;
-
-    const summary = {
-      generatedAt: new Date().toISOString(),
-      files: state.project.entries.map((entry) => ({
-        path: entry.path,
-        type: entry.type,
-        size: entry.size,
-        jsonStatus: entry.jsonError ? "error" : entry.json ? "parsed" : "loaded",
-      })),
-      report: {
-        root: state.project.report.root,
-        theme: state.project.report.theme,
-        pages: state.project.report.pages.map((page) => ({
-          id: page.id,
-          displayName: page.displayName,
-          width: page.width,
-          height: page.height,
-          background: page.background,
-          visuals: page.visuals.map((visual) => ({
-            id: visual.id,
-            title: visual.title,
-            type: visual.type,
-            position: visual.position,
-            roles: visual.roles,
-            fields: visual.fields,
-            style: visual.style,
-            textContent: visual.textContent,
-            data: visual.data,
-            path: visual.path,
-          })),
-        })),
-      },
-      semantic: {
-        root: state.project.semantic.root,
-        tables: state.project.semantic.tables.map((table) => ({
-          name: table.name,
-          columns: table.columns,
-          measures: table.measures,
-          hierarchies: table.hierarchies,
-          partitions: table.partitions,
-        })),
-      },
-      issues: state.project.issues,
-    };
-
-    const blob = new Blob([JSON.stringify(summary, null, 2)], { type: "application/json" });
-    const link = document.createElement("a");
-    link.href = URL.createObjectURL(blob);
-    link.download = "pbip-viewer-summary.json";
-    link.click();
-    URL.revokeObjectURL(link.href);
   }
 
   function getCurrentPage() {
@@ -2566,5 +2956,7 @@
   globalTarget.PBIPViewerParser = {
     analyzeProject,
     parseTmdl,
+    evaluateDax,
+    extractInlineData,
   };
 })();
