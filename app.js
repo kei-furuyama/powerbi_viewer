@@ -111,7 +111,8 @@
       state.project = project;
       state.selectedPageId = project.report.pages[0]?.id || null;
       state.selectedVisualId = project.report.pages[0]?.visuals[0]?.id || null;
-      state.activeTab = project.report.pages.length ? "canvas" : "issues";
+      // 検査でエラーがあれば検出事項タブを最初に表示
+      state.activeTab = project.validation?.errors > 0 || !project.report.pages.length ? "issues" : "canvas";
       setStatus(makeProjectStatus(project));
       render();
     } catch (error) {
@@ -269,6 +270,7 @@
     const dataModel = buildDataModel(semantic);
     hydrateVisualData(report, dataModel);
     const measureUsage = computeMeasureUsage(report, semantic);
+    const validation = validateProject(normalizedEntries, report, semantic, jsonByPath);
     const pbipFiles = normalizedEntries.filter((entry) => entry.path.toLowerCase().endsWith(".pbip"));
 
     if (!pbipFiles.length) {
@@ -337,6 +339,15 @@
       });
     }
 
+    // PBIP整合性チェックの結果を反映(エラー/警告は先頭に集約サマリを置く)
+    issues.push(...validation.problems);
+    const checkSummary = validation.errors > 0
+      ? { level: "error", title: `PBIP検査: ${validation.errors}件のエラー`, detail: `このままではPower BIで正しく開けない可能性があります（警告${validation.warnings}件）。下の項目を確認してください。` }
+      : validation.warnings > 0
+        ? { level: "warning", title: `PBIP検査: 警告${validation.warnings}件`, detail: "致命的エラーはありませんが、確認を推奨する項目があります。" }
+        : { level: "info", title: "PBIP検査: 問題は見つかりませんでした", detail: "構造・参照ともに整合しています。" };
+    issues.unshift(checkSummary);
+
     return {
       uploadedAt: new Date().toISOString(),
       entries: normalizedEntries.sort((a, b) => a.path.localeCompare(b.path)),
@@ -345,6 +356,7 @@
       semantic,
       dataModel: { loadedTables: dataModel.loadedTables },
       measureUsage,
+      validation,
       issues,
     };
   }
@@ -2078,6 +2090,138 @@
     return `${sign}${digits}${decPart != null ? `.${decPart}` : ""}`;
   }
 
+  // --- PBIP整合性チェック(壊れていないかの検査) ----------------------
+
+  function validateProject(entries, report, semantic, jsonByPath) {
+    const problems = [];
+    const add = (level, title, detail) => problems.push({ level, title, detail, category: "検査" });
+
+    // 1. JSON解析エラー(Power BIで開けない致命的要因)
+    for (const entry of entries) {
+      if (entry.jsonError) {
+        add("error", "JSONが壊れています", `${entry.path}: ${entry.jsonError}（末尾カンマやクォート漏れに注意）`);
+      }
+    }
+
+    // 2. 必須ファイルの存在
+    const lowerPaths = entries.map((entry) => entry.path.toLowerCase());
+    const has = (suffix) => lowerPaths.some((path) => path.endsWith(suffix));
+    if (report.root) {
+      if (!has("/definition.pbir") && !has("definition.pbir")) {
+        add("warning", "definition.pbir が見つかりません", "Reportのデータセット参照(definition.pbir)が無いとPower BIで開けないことがあります。");
+      }
+      const hasPagesContainer = report.pages.length || report.reportJson?.sections;
+      if (!hasPagesContainer) {
+        add("error", "ページ定義がありません", "definition/pages/*/page.json が見つかりません。");
+      }
+    }
+    const hasSemanticFiles = entries.some((entry) => /\.tmdl$|model\.bim$/i.test(entry.path));
+    const hasSemanticRoot = entries.some((entry) => /\.semanticmodel\//i.test(entry.path));
+    if (hasSemanticRoot && !hasSemanticFiles) {
+      add("warning", "Semantic Model定義が不足", ".SemanticModel フォルダはありますが model.tmdl / model.bim 等が見つかりません。");
+    }
+
+    // 3. ページ整合性(pageOrderと実体の不一致・重複)
+    const pageIds = report.pages.map((page) => page.id);
+    const dupPages = pageIds.filter((id, index) => pageIds.indexOf(id) !== index);
+    for (const id of new Set(dupPages)) add("error", "ページ名が重複しています", id);
+
+    const order = Array.isArray(report.pagesJson?.pageOrder) ? report.pagesJson.pageOrder.map(String) : [];
+    if (order.length) {
+      for (const id of order) {
+        if (!pageIds.includes(id)) add("error", "pageOrderが実在しないページを参照", `pages.json の pageOrder に "${id}" がありますが、対応する page.json がありません。`);
+      }
+      for (const id of pageIds) {
+        if (!order.includes(id)) add("warning", "pageOrderに無いページ", `"${id}" は pages.json の pageOrder に含まれていません。`);
+      }
+    }
+    for (const page of report.pages) {
+      if (!page.json?.name) add("error", "page.jsonにnameがありません", page.path);
+    }
+
+    // 4. ビジュアル整合性
+    for (const page of report.pages) {
+      const ids = page.visuals.map((visual) => visual.id);
+      for (const id of new Set(ids.filter((id, index) => ids.indexOf(id) !== index))) {
+        add("warning", "ビジュアル名が重複しています", `${page.displayName} / ${id}`);
+      }
+      for (const visual of page.visuals) {
+        if (visual.jsonStatus === "missing") add("error", "visual.jsonを解析できません", visual.path);
+        if (visual.type === "unknown") add("warning", "visualTypeが指定されていません", `${page.displayName} / ${visual.id}`);
+        if (visual.position?.fallback) add("warning", "positionがありません", `${page.displayName} / ${visual.id}（座標が補完されました）`);
+      }
+    }
+
+    // 5. フィールド参照の実在チェック(Claude生成で多い「存在しない列/メジャー」参照)
+    if (semantic.tables.length) {
+      const index = new Map();
+      for (const table of semantic.tables) {
+        index.set(normalizeName(table.name), {
+          name: table.name,
+          cols: new Set(table.columns.map((column) => normalizeName(column.name))),
+          meas: new Set(table.measures.map((measure) => normalizeName(measure.name))),
+        });
+      }
+      const checked = new Set();
+      for (const visual of report.visuals) {
+        for (const role of visual.roles || []) {
+          for (const field of role.fields) {
+            if (!field.table || !field.name) continue;
+            const key = `${visual.pageId}/${visual.id}/${field.label}`;
+            if (checked.has(key)) continue;
+            checked.add(key);
+            const table = index.get(normalizeName(field.table));
+            if (!table) {
+              add("error", "存在しないテーブルを参照", `${visual.title || visual.id}: '${field.table}' はモデルにありません。`);
+              continue;
+            }
+            const nn = normalizeName(field.name);
+            const exists = field.kind === "measure" ? table.meas.has(nn) : table.cols.has(nn) || table.meas.has(nn);
+            if (!exists) {
+              add("error", "存在しない列/メジャーを参照", `${visual.title || visual.id}: ${field.table}[${field.name}] がモデルにありません。`);
+            }
+          }
+        }
+      }
+
+      // 6. メジャーDAXの参照チェック
+      const allMeasureNames = new Set();
+      const allColumnNames = new Set();
+      for (const table of semantic.tables) {
+        for (const measure of table.measures) allMeasureNames.add(normalizeName(measure.name));
+        for (const column of table.columns) allColumnNames.add(normalizeName(column.name));
+      }
+      for (const table of semantic.tables) {
+        for (const measure of table.measures) {
+          const refs = String(measure.expression || "").match(/\[([^\]]+)\]/g) || [];
+          for (const ref of refs) {
+            const nn = normalizeName(ref.slice(1, -1));
+            if (nn === normalizeName(measure.name)) continue;
+            if (!allMeasureNames.has(nn) && !allColumnNames.has(nn)) {
+              add("warning", "メジャーDAXの参照が見つかりません", `${table.name}[${measure.name}] が [${ref.slice(1, -1)}] を参照していますが、モデルに存在しません。`);
+            }
+          }
+        }
+      }
+
+      // 7. リレーションの列実在チェック
+      for (const rel of semantic.relationships) {
+        if (!rel.fromTable && !rel.toTable) continue;
+        const from = index.get(normalizeName(rel.fromTable));
+        const to = index.get(normalizeName(rel.toTable));
+        if (rel.fromTable && !from) add("warning", "リレーションのテーブルが不明", `${rel.name || "relationship"}: ${rel.fromTable}`);
+        if (rel.toTable && !to) add("warning", "リレーションのテーブルが不明", `${rel.name || "relationship"}: ${rel.toTable}`);
+        if (from && rel.fromColumn && !from.cols.has(normalizeName(rel.fromColumn))) add("warning", "リレーションの列が不明", `${rel.fromTable}[${rel.fromColumn}]`);
+        if (to && rel.toColumn && !to.cols.has(normalizeName(rel.toColumn))) add("warning", "リレーションの列が不明", `${rel.toTable}[${rel.toColumn}]`);
+      }
+    }
+
+    void jsonByPath;
+    const errors = problems.filter((problem) => problem.level === "error").length;
+    const warnings = problems.filter((problem) => problem.level === "warning").length;
+    return { problems, errors, warnings };
+  }
+
   // --- ビジュアルへ実データを付与 --------------------------------------
 
   function hydrateVisualData(report, dataModel) {
@@ -3048,7 +3192,11 @@
   }
 
   function makeProjectStatus(project) {
-    return `${project.report.pages.length}ページ / ${project.report.visuals.length}ビジュアル / ${project.semantic.tables.length}テーブル`;
+    const base = `${project.report.pages.length}ページ / ${project.report.visuals.length}ビジュアル / ${project.semantic.tables.length}テーブル`;
+    const v = project.validation;
+    if (!v) return base;
+    const check = v.errors > 0 ? `検査NG(エラー${v.errors})` : v.warnings > 0 ? `検査△(警告${v.warnings})` : "検査OK";
+    return `${base} / ${check}`;
   }
 
   function setStatus(text) {

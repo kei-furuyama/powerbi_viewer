@@ -469,6 +469,38 @@ assert.equal(def.style.legend.show, true, "legend defaults on when unspecified")
 
 console.log("legend smoke test passed");
 
+// --- PBIP整合性チェック ---
+assert.equal(project.validation.errors, 0, "valid sample project passes validation");
+
+const brokenProject = analyzeProject(
+  [
+    { path: "B.pbip", text: JSON.stringify({ version: "1.0", artifacts: [{ report: { path: "B.Report" } }] }), size: 40 },
+    { path: "B.Report/definition.pbir", text: JSON.stringify({ version: "4.0", datasetReference: { byPath: "../B.SemanticModel" } }), size: 60 },
+    { path: "B.Report/definition/pages/pages.json", text: JSON.stringify({ pageOrder: ["P", "GHOST"] }), size: 40 },
+    { path: "B.Report/definition/pages/P/page.json", text: JSON.stringify({ name: "P", displayName: "P", width: 1280, height: 720 }), size: 60 },
+    { path: "B.Report/definition/pages/P/visuals/v1/visual.json", text: '{ "name": "v1", "visual": { "visualType": "card", }, }', size: 60 },
+    {
+      path: "B.Report/definition/pages/P/visuals/v2/visual.json",
+      text: JSON.stringify({
+        name: "v2",
+        position: { x: 0, y: 0, width: 200, height: 120, z: 0 },
+        visual: { visualType: "cardVisual", query: { queryState: { Data: { projections: [{ field: { Measure: { Expression: { SourceRef: { Entity: "案件" } }, Property: "存在しないメジャー" } }, queryRef: "案件.存在しないメジャー", nativeQueryRef: "x" }] } } } },
+      }),
+      size: 200,
+    },
+    { path: "B.SemanticModel/definition/tables/案件.tmdl", text: ["table 案件", "\tmeasure 件数 = COUNTROWS('案件')", "\tcolumn 区分", "\t\tdataType: string"].join("\n"), size: 120 },
+  ],
+  [],
+);
+
+assert.ok(brokenProject.validation.errors >= 3, "broken project flags multiple errors");
+const titles = brokenProject.validation.problems.map((p) => p.title);
+assert.ok(titles.includes("JSONが壊れています"), "detects malformed JSON");
+assert.ok(titles.includes("pageOrderが実在しないページを参照"), "detects pageOrder mismatch");
+assert.ok(titles.includes("存在しない列/メジャーを参照"), "detects missing measure reference");
+
+console.log("validation smoke test passed");
+
 const legacyReportConfig = {
   name: "legacy_donut",
   layouts: [
