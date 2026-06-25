@@ -2545,7 +2545,8 @@
     if (type.includes("bar") || type.includes("column") || type.includes("histogram") || type.includes("funnel") || type.includes("waterfall")) {
       const horizontal = type.includes("bar") && !type.includes("column");
       if (data?.kind === "category" && data.series.length) {
-        return renderDataBars(data, theme, horizontal);
+        const showLabels = visual.style?.dataLabels?.show !== false;
+        return renderDataBars(data, theme, horizontal, showLabels);
       }
       const heights = [42, 70, 54, 86, 62];
       const bars = heights
@@ -2640,7 +2641,7 @@
       .join(", ");
   }
 
-  function renderDataBars(data, theme, horizontal) {
+  function renderDataBars(data, theme, horizontal, showLabels = true) {
     const bars = data.series
       .map((point, index) => {
         const ratio = Math.max(0, Math.abs(point.value) / data.max);
@@ -2652,13 +2653,13 @@
             <div class="hbar-row" title="${escapeAttribute(`${point.label}: ${valueText}`)}">
               <span class="hbar-label">${escapeHtml(point.label)}</span>
               <span class="hbar-track"><span class="hbar-fill" style="width:${size};background:${color}"></span></span>
-              <span class="hbar-value">${escapeHtml(valueText)}</span>
+              ${showLabels ? `<span class="hbar-value">${escapeHtml(valueText)}</span>` : ""}
             </div>
           `;
         }
         return `
           <div class="vbar" title="${escapeAttribute(`${point.label}: ${valueText}`)}">
-            <span class="vbar-value">${escapeHtml(valueText)}</span>
+            ${showLabels ? `<span class="vbar-value">${escapeHtml(valueText)}</span>` : ""}
             <span class="vbar-fill" style="height:${size};background:${color}"></span>
             <span class="vbar-label">${escapeHtml(point.label)}</span>
           </div>
