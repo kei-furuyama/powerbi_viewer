@@ -2378,8 +2378,8 @@
 
       const showTitle = visual.hasExplicitTitle;
       const titleStyle = [
-        style.title?.color ? `color:${style.title.color}` : "",
-        style.title?.align ? `text-align:${cssAlign(style.title.align)}` : "",
+        style.title?.color ? `color:${escapeAttribute(style.title.color)}` : "",
+        style.title?.align ? `text-align:${escapeAttribute(cssAlign(style.title.align))}` : "",
       ].filter(Boolean).join(";");
 
       // カードのアクセントバー(Power BIの左帯)を再現
@@ -2458,12 +2458,12 @@
       // 実フォントサイズ(pt)をキャンバス高さ基準(cqh)へ変換してズームに追従
       const toCqh = (pt) => `${(((pt * 96) / 72 / Math.max(1, pageHeight)) * 100).toFixed(2)}cqh`;
       const valueStyle = [
-        card.valueColor ? `color:${card.valueColor}` : "",
-        card.valueSize ? `font-size:${toCqh(card.valueSize)}` : "",
+        card.valueColor ? `color:${escapeAttribute(card.valueColor)}` : "",
+        card.valueSize ? `font-size:${escapeAttribute(toCqh(card.valueSize))}` : "",
       ].filter(Boolean).join(";");
       const labelStyle = [
-        card.labelColor ? `color:${card.labelColor}` : "",
-        card.labelSize ? `font-size:${toCqh(card.labelSize)}` : "",
+        card.labelColor ? `color:${escapeAttribute(card.labelColor)}` : "",
+        card.labelSize ? `font-size:${escapeAttribute(toCqh(card.labelSize))}` : "",
       ].filter(Boolean).join(";");
       return `
         <div class="mini-card">
@@ -2561,10 +2561,10 @@
           const runs = paragraph.runs
             .map((run) => {
               const styles = [
-                run.color ? `color:${run.color}` : "",
+                run.color ? `color:${escapeAttribute(run.color)}` : "",
                 run.bold ? "font-weight:700" : "",
                 run.italic ? "font-style:italic" : "",
-                run.sizePt ? `font-size:${toCqh(run.sizePt).toFixed(2)}cqh` : "",
+                run.sizePt ? `font-size:${escapeAttribute(`${toCqh(run.sizePt).toFixed(2)}cqh`)}` : "",
               ].filter(Boolean).join(";");
               return `<span style="${styles}">${escapeHtml(run.text)}</span>`;
             })
