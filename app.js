@@ -66,6 +66,8 @@
       tab.addEventListener("click", () => {
         state.activeTab = tab.dataset.tab;
         renderTabs();
+        // キャンバス表示時は実幅を測ってフォントスケールを再計算
+        if (state.activeTab === "canvas") renderCanvas();
       });
     });
 
@@ -85,6 +87,15 @@
 
     els.dropZone.addEventListener("drop", (event) => {
       handleFiles(event.dataTransfer.files);
+    });
+
+    // キャンバス幅が変わったらフォントスケールを再計算するため再描画
+    let resizeTimer = null;
+    window.addEventListener("resize", () => {
+      if (resizeTimer) clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(() => {
+        if (state.project && state.activeTab === "canvas") renderCanvas();
+      }, 150);
     });
   }
 
@@ -794,6 +805,11 @@
       labelColor: readExprColor(labelProps?.fontColor),
       valueSize: parseFontSize(readExpr(valueProps?.fontSize)),
       labelSize: parseFontSize(readExpr(labelProps?.fontSize)),
+      valueBold: readExprBool(valueProps?.bold) === true,
+      valueAlign: cssAlignName(readExprString(valueProps?.horizontalAlignment)),
+      labelAlign: cssAlignName(readExprString(labelProps?.horizontalAlignment)),
+      labelPosition: /below/i.test(readExprString(labelProps?.position)) ? "below" : "above",
+      labelShow: readExprBool(labelProps?.show) !== false,
     };
   }
 
@@ -2028,6 +2044,11 @@
     return String(Math.round(value * factor) / factor);
   }
 
+  // ポイント(pt)を、キャンバス実描画スケールに合わせたピクセルへ変換
+  function ptToPx(pt, scale) {
+    return `${(pt * (96 / 72) * (scale || 0.583)).toFixed(1)}px`;
+  }
+
   function groupThousands(numericText) {
     const [intPart, decPart] = String(numericText).split(".");
     const sign = intPart.startsWith("-") ? "-" : "";
@@ -2355,6 +2376,9 @@
     els.reportCanvas.style.color = state.project?.report?.theme?.foreground || "";
 
     const theme = getTheme();
+    // キャンバスの実描画幅から論理座標→ピクセルのスケールを算出(ズーム追従・全ブラウザ対応)
+    const canvasWidthPx = els.reportCanvas.clientWidth || 1120;
+    const fontScale = canvasWidthPx / page.width;
 
     for (const visual of page.visuals) {
       const style = visual.style || {};
@@ -2395,7 +2419,7 @@
       box.innerHTML = `
         ${accentHtml}
         ${showTitle ? `<div class="visual-title" style="${titleStyle}">${escapeHtml(visual.title)}</div>` : ""}
-        <div class="visual-body">${renderVisualPreview(visual, theme, page.height)}</div>
+        <div class="visual-body">${renderVisualPreview(visual, theme, fontScale)}</div>
       `;
       box.addEventListener("click", () => {
         state.selectedVisualId = visual.id;
@@ -2428,7 +2452,7 @@
     return result;
   }
 
-  function renderVisualPreview(visual, theme = DEFAULT_THEME_COLORS, pageHeight = DEFAULT_PAGE.height) {
+  function renderVisualPreview(visual, theme = DEFAULT_THEME_COLORS, fontScale = 0.583) {
     const type = visual.type.toLowerCase();
     const categories = roleFieldsOf(visual, "category");
     const values = roleFieldsOf(visual, "value");
@@ -2437,7 +2461,7 @@
     const color = theme[0] || "#118DFF";
 
     if (type.includes("textbox") || type.includes("text")) {
-      return renderTextbox(visual, pageHeight);
+      return renderTextbox(visual, fontScale);
     }
 
     if (type.includes("image")) {
@@ -2455,22 +2479,23 @@
       const valueText = data?.kind === "card" ? data.text : "—";
       const label = (data?.kind === "card" && data.label) || valueLabel;
       const card = visual.style?.card || {};
-      // 実フォントサイズ(pt)をキャンバス高さ基準(cqh)へ変換してズームに追従
-      const toCqh = (pt) => `${(((pt * 96) / 72 / Math.max(1, pageHeight)) * 100).toFixed(2)}cqh`;
       const valueStyle = [
         card.valueColor ? `color:${escapeAttribute(card.valueColor)}` : "",
-        card.valueSize ? `font-size:${escapeAttribute(toCqh(card.valueSize))}` : "",
+        card.valueBold ? "font-weight:700" : "",
+        card.valueSize ? `font-size:${escapeAttribute(ptToPx(card.valueSize, fontScale))}` : "",
+        card.valueAlign ? `text-align:${escapeAttribute(card.valueAlign)}` : "",
       ].filter(Boolean).join(";");
       const labelStyle = [
         card.labelColor ? `color:${escapeAttribute(card.labelColor)}` : "",
-        card.labelSize ? `font-size:${escapeAttribute(toCqh(card.labelSize))}` : "",
+        card.labelSize ? `font-size:${escapeAttribute(ptToPx(card.labelSize, fontScale))}` : "",
+        card.labelAlign ? `text-align:${escapeAttribute(card.labelAlign)}` : "",
       ].filter(Boolean).join(";");
-      return `
-        <div class="mini-card">
-          <div class="mini-card-value" style="${valueStyle}">${escapeHtml(valueText)}</div>
-          <div class="mini-card-label" style="${labelStyle}">${escapeHtml(label)}</div>
-        </div>
-      `;
+      const valueHtml = `<div class="mini-card-value" style="${valueStyle}">${escapeHtml(valueText)}</div>`;
+      const labelHtml = card.labelShow === false
+        ? ""
+        : `<div class="mini-card-label" style="${labelStyle}">${escapeHtml(label)}</div>`;
+      const body = card.labelPosition === "below" ? `${valueHtml}${labelHtml}` : `${labelHtml}${valueHtml}`;
+      return `<div class="mini-card">${body}</div>`;
     }
 
     if (type.includes("line") || type.includes("area")) {
@@ -2550,10 +2575,8 @@
     `;
   }
 
-  function renderTextbox(visual, pageHeight) {
+  function renderTextbox(visual, fontScale) {
     const paragraphs = visual.paragraphs || [];
-    // フォントサイズはキャンバス高さ基準のコンテナ単位(cqh)へ変換し、ズームに追従させる
-    const toCqh = (pt) => ((pt * 96) / 72 / Math.max(1, pageHeight)) * 100;
 
     if (paragraphs.length) {
       const html = paragraphs
@@ -2564,7 +2587,7 @@
                 run.color ? `color:${escapeAttribute(run.color)}` : "",
                 run.bold ? "font-weight:700" : "",
                 run.italic ? "font-style:italic" : "",
-                run.sizePt ? `font-size:${escapeAttribute(`${toCqh(run.sizePt).toFixed(2)}cqh`)}` : "",
+                run.sizePt ? `font-size:${escapeAttribute(ptToPx(run.sizePt, fontScale))}` : "",
               ].filter(Boolean).join(";");
               return `<span style="${styles}">${escapeHtml(run.text)}</span>`;
             })
