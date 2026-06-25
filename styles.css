@@ -584,8 +584,9 @@ select {
   gap: 8px;
   align-items: center;
   justify-content: center;
+  align-self: stretch;
   height: 100%;
-  min-height: 0;
+  min-height: 90px;
 }
 
 /* 凡例の位置(legend.position)を反映 */
@@ -623,10 +624,10 @@ select {
   height: auto;
 }
 
-/* 凡例なし: 円は高さ基準で大きく中央に */
+/* 凡例なし: 円は幅基準で大きく中央に(高さ循環参照を回避) */
 .mini-pie-wrap.legend-none .mini-pie {
-  height: 100%;
-  width: auto;
+  width: min(100%, 240px);
+  height: auto;
   max-width: 100%;
 }
 
