@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>PBIP Viewer</title>
+    <link rel="stylesheet" href="./styles.css" />
+    <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js" defer></script>
+    <script src="./app.js" defer></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true">P</span>
+          <div>
+            <h1>PBIP Viewer</h1>
+            <p id="statusText">PBIPプロジェクトを選択してください</p>
+          </div>
+        </div>
+        <div class="actions">
+          <label class="button primary">
+            <input id="folderInput" type="file" webkitdirectory multiple />
+            フォルダを開く
+          </label>
+          <label class="button">
+            <input id="fileInput" type="file" multiple accept=".zip,.pbip,.pbir,.json,.tmdl,.platform" />
+            ファイルを開く
+          </label>
+          <button id="exportButton" class="button" type="button" disabled>概要を書き出す</button>
+        </div>
+      </header>
+
+      <main id="dropZone" class="workspace">
+        <aside class="sidebar">
+          <section class="panel">
+            <div class="panel-title">概要</div>
+            <div id="summaryMetrics" class="metrics"></div>
+          </section>
+
+          <section class="panel grow">
+            <div class="panel-title">ページ</div>
+            <div id="pageList" class="page-list"></div>
+          </section>
+        </aside>
+
+        <section class="content">
+          <nav class="tabs" aria-label="viewer sections">
+            <button class="tab active" type="button" data-tab="canvas">キャンバス</button>
+            <button class="tab" type="button" data-tab="visuals">ビジュアル</button>
+            <button class="tab" type="button" data-tab="model">モデル</button>
+            <button class="tab" type="button" data-tab="files">ファイル</button>
+            <button class="tab" type="button" data-tab="issues">検出事項</button>
+          </nav>
+
+          <section id="emptyState" class="empty-state">
+            <div class="drop-target">
+              <div class="drop-icon" aria-hidden="true">PBIP</div>
+              <h2>Power BI Projectを解析</h2>
+              <p>`.pbip`を含むフォルダ、またはzipをここにドロップできます。</p>
+            </div>
+          </section>
+
+          <section id="canvasView" class="view active">
+            <div class="canvas-toolbar">
+              <label>
+                ページ
+                <select id="pageSelect"></select>
+              </label>
+              <div id="canvasMeta" class="canvas-meta"></div>
+            </div>
+            <div class="canvas-scroll">
+              <div id="reportCanvas" class="report-canvas" aria-label="report canvas"></div>
+            </div>
+            <div id="visualInspector" class="inspector"></div>
+          </section>
+
+          <section id="visualsView" class="view">
+            <div id="visualTable" class="data-table"></div>
+          </section>
+
+          <section id="modelView" class="view">
+            <div id="modelExplorer" class="model-grid"></div>
+          </section>
+
+          <section id="filesView" class="view">
+            <div id="fileTable" class="data-table"></div>
+          </section>
+
+          <section id="issuesView" class="view">
+            <div id="issueList" class="issue-list"></div>
+          </section>
+        </section>
+      </main>
+    </div>
+  </body>
+</html>
