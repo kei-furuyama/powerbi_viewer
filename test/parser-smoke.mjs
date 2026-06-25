@@ -110,3 +110,98 @@ assert.equal(project.semantic.tables[0].columns.length, 2);
 assert.equal(project.semantic.tables[0].measures.length, 1);
 
 console.log("parser smoke test passed");
+
+const legacyReportConfig = {
+  name: "legacy_donut",
+  layouts: [
+    {
+      id: 0,
+      position: { x: 20, y: 30, z: 0, width: 240, height: 180, tabOrder: 0 },
+    },
+  ],
+  singleVisual: {
+    visualType: "donutChart",
+    prototypeQuery: {
+      Version: 2,
+      From: [{ Name: "s", Entity: "Status", Type: 0 }],
+      Select: [
+        {
+          Column: {
+            Expression: { SourceRef: { Source: "s" } },
+            Property: "Label",
+          },
+          Name: "s.Label",
+        },
+        {
+          Measure: {
+            Expression: { SourceRef: { Source: "s" } },
+            Property: "Done Count",
+          },
+          Name: "s.Done Count",
+        },
+      ],
+    },
+  },
+};
+
+const legacyProject = analyzeProject(
+  [
+    {
+      path: "Legacy.pbip",
+      text: JSON.stringify({ version: "1.0", artifacts: [{ report: { path: "Legacy.Report" } }] }),
+      size: 80,
+    },
+    {
+      path: "Legacy.Report/report.json",
+      text: JSON.stringify({
+        sections: [
+          {
+            name: "ReportSection",
+            displayName: "Legacy Page",
+            width: 1920,
+            height: 1080,
+            visualContainers: [
+              {
+                config: JSON.stringify(legacyReportConfig),
+                filters: "[]",
+                x: 20,
+                y: 30,
+                z: 0,
+                width: 240,
+                height: 180,
+              },
+            ],
+          },
+        ],
+      }),
+      size: 640,
+    },
+    {
+      path: "Legacy.SemanticModel/model.bim",
+      text: JSON.stringify({
+        model: {
+          tables: [
+            {
+              name: "Status",
+              columns: [{ name: "Label", dataType: "string" }],
+              measures: [{ name: "Done Count", expression: "COUNTROWS(Status)" }],
+            },
+          ],
+        },
+      }),
+      size: 240,
+    },
+  ],
+  [],
+);
+
+assert.equal(legacyProject.report.pages.length, 1);
+assert.equal(legacyProject.report.pages[0].displayName, "Legacy Page");
+assert.equal(legacyProject.report.visuals.length, 1);
+assert.equal(legacyProject.report.visuals[0].type, "donutChart");
+assert.ok(legacyProject.report.visuals[0].fields.some((field) => field.label === "Status[Label]"));
+assert.ok(legacyProject.report.visuals[0].fields.some((field) => field.label === "Status[Done Count]"));
+assert.equal(legacyProject.semantic.tables.length, 1);
+assert.equal(legacyProject.semantic.tables[0].name, "Status");
+
+console.log("legacy parser smoke test passed");

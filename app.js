@@ -340,7 +340,7 @@
     report.root = reportRoots[0] || null;
 
     report.definitionPbir = firstJsonEnding(jsonByPath, "/definition.pbir");
-    report.reportJson = firstJsonEnding(jsonByPath, "/definition/report.json");
+    report.reportJson = firstJsonEnding(jsonByPath, "/definition/report.json") || firstJsonEnding(jsonByPath, "/report.json");
     report.pagesJson = firstJsonEnding(jsonByPath, "/definition/pages/pages.json");
     report.meta = extractReportMeta(report.definitionPbir, report.reportJson);
 
@@ -349,7 +349,7 @@
       return lower.endsWith("/page.json") && lower.includes("/definition/pages/");
     });
 
-    const pages = [];
+    let pages = [];
     for (const entry of pageEntries) {
       const pageJson = jsonByPath.get(entry.path);
       if (!pageJson) continue;
@@ -379,9 +379,17 @@
         height: dimensions.height,
         type: pageJson.type || pageJson.pageType || "ReportPage",
         visibility: pageJson.visibility || "Visible",
+        ordinal: Number.isFinite(Number(pageJson.ordinal)) ? Number(pageJson.ordinal) : null,
         visuals,
         json: pageJson,
       });
+    }
+
+    if (!pages.length && Array.isArray(report.reportJson?.sections)) {
+      const reportPath = findJsonPath(jsonByPath, report.reportJson) || `${report.root || "Report"}/report.json`;
+      pages = report.reportJson.sections
+        .map((section, index) => extractLegacyPage(section, reportPath, index))
+        .filter(Boolean);
     }
 
     const order = Array.isArray(report.pagesJson?.pageOrder) ? report.pagesJson.pageOrder.map(String) : [];
@@ -389,6 +397,7 @@
       const ia = order.indexOf(a.id);
       const ib = order.indexOf(b.id);
       if (ia >= 0 || ib >= 0) return (ia < 0 ? 9999 : ia) - (ib < 0 ? 9999 : ib);
+      if (Number.isFinite(a.ordinal) && Number.isFinite(b.ordinal)) return a.ordinal - b.ordinal;
       return a.displayName.localeCompare(b.displayName);
     });
 
@@ -423,6 +432,69 @@
     return meta;
   }
 
+  function extractLegacyPage(section, reportPath, index) {
+    if (!section || typeof section !== "object") return null;
+
+    const width = numberOr(section.width, DEFAULT_PAGE.width);
+    const height = numberOr(section.height, DEFAULT_PAGE.height);
+    const dimensions = { width, height };
+    const id = String(section.name || `ReportSection${index + 1}`);
+    const containers = Array.isArray(section.visualContainers) ? section.visualContainers : [];
+
+    return {
+      id,
+      path: `${reportPath}#sections[${index}]`,
+      dir: dirname(reportPath),
+      displayName: String(section.displayName || section.name || `Page ${index + 1}`),
+      width,
+      height,
+      type: "LegacyReportSection",
+      visibility: "Visible",
+      ordinal: Number.isFinite(Number(section.ordinal)) ? Number(section.ordinal) : index,
+      visuals: containers
+        .map((container, visualIndex) =>
+          extractLegacyVisual(container, id, dimensions, visualIndex, `${reportPath}#sections[${index}].visualContainers[${visualIndex}]`),
+        )
+        .filter(Boolean)
+        .sort((a, b) => (a.position.z || 0) - (b.position.z || 0)),
+      json: section,
+    };
+  }
+
+  function extractLegacyVisual(container, pageId, pageDimensions, index, path) {
+    if (!container || typeof container !== "object") return null;
+
+    const config = parseEmbeddedJson(container.config) || {};
+    const filters = parseEmbeddedJson(container.filters) || [];
+    const query = parseEmbeddedJson(container.query) || null;
+    const dataTransforms = parseEmbeddedJson(container.dataTransforms) || null;
+    const root = {
+      ...config,
+      filters,
+      query,
+      dataTransforms,
+      position: config.layouts?.[0]?.position || {
+        x: container.x,
+        y: container.y,
+        z: container.z,
+        width: container.width,
+        height: container.height,
+      },
+      singleVisual: config.singleVisual || {},
+      container,
+    };
+
+    return extractVisual(
+      {
+        path,
+      },
+      root,
+      pageId,
+      pageDimensions,
+      index,
+    );
+  }
+
   function getPageDimensions(pageJson) {
     const width = numberOr(pageJson.width ?? pageJson.canvas?.width ?? pageJson.size?.width, DEFAULT_PAGE.width);
     const height = numberOr(pageJson.height ?? pageJson.canvas?.height ?? pageJson.size?.height, DEFAULT_PAGE.height);
@@ -447,7 +519,7 @@
       index,
     );
     const fields = extractFields(visualRoot);
-    const title = extractTitle(visualRoot) || typeLabel(type);
+    const title = extractTitle(visualRoot) || extractTextContent(visualRoot) || typeLabel(type);
 
     return {
       id: String(visualRoot.name || fallbackId),
@@ -459,7 +531,7 @@
       position,
       fields,
       filterCount: countKeyMatches(visualRoot, /filter/i),
-      hasQuery: Boolean(visualObject.query || visualRoot.query),
+      hasQuery: Boolean(visualObject.query || visualRoot.query || visualObject.prototypeQuery),
       jsonStatus: json ? "parsed" : "missing",
     };
   }
@@ -507,8 +579,40 @@
         findFirstScalar(node, ["Value", "value", "text", "Text"]) ||
         findFirstScalar(node, ["Literal"]);
       if (typeof text === "string" && text.length < 120) {
-        best = cleanLiteral(text);
+        const candidate = cleanLiteral(text);
+        if (isDisplayText(candidate)) best = candidate;
       }
+    });
+
+    return best;
+  }
+
+  function isDisplayText(value) {
+    const text = String(value || "").trim();
+    if (!text) return false;
+    if (/^(true|false)$/i.test(text)) return false;
+    if (/^-?\d+(?:\.\d+)?[DLM]?$/i.test(text)) return false;
+    if (/^#[0-9a-f]{3,8}$/i.test(text)) return false;
+    return true;
+  }
+
+  function extractTextContent(root) {
+    let best = null;
+
+    walk(root, (node, key) => {
+      if (best || String(key).toLowerCase() !== "paragraphs") return;
+
+      const raw = findFirstScalar(node, ["Value", "value"]);
+      if (typeof raw !== "string") return;
+
+      const parsed = parseEmbeddedJson(cleanLiteral(raw));
+      const text = parsed?.paragraphs
+        ?.flatMap((paragraph) => paragraph.textRuns || [])
+        .map((run) => run.value)
+        .join("")
+        .trim();
+
+      if (text) best = text.slice(0, 140);
     });
 
     return best;
@@ -517,6 +621,7 @@
   function extractFields(root) {
     const fields = [];
     const seen = new Set();
+    const aliasMap = buildSourceAliasMap(root);
 
     function add(kind, table, name, role = "") {
       if (!name) return;
@@ -540,22 +645,22 @@
       if (!node || typeof node !== "object") return;
 
       if (node.Column && typeof node.Column === "object") {
-        const field = fieldFromExpression(node.Column);
+        const field = fieldFromExpression(node.Column, aliasMap);
         add("column", field.table, field.name, String(key || ""));
       }
 
       if (node.Measure && typeof node.Measure === "object") {
-        const field = fieldFromExpression(node.Measure);
+        const field = fieldFromExpression(node.Measure, aliasMap);
         add("measure", field.table, field.name, String(key || ""));
       }
 
       if (node.Aggregation && typeof node.Aggregation === "object") {
-        const field = fieldFromExpression(node.Aggregation);
+        const field = fieldFromExpression(node.Aggregation, aliasMap);
         add("aggregation", field.table, field.name, String(key || ""));
       }
 
       if (node.Hierarchy && typeof node.Hierarchy === "object") {
-        const field = fieldFromExpression(node.Hierarchy);
+        const field = fieldFromExpression(node.Hierarchy, aliasMap);
         add("hierarchy", field.table, field.name, String(key || ""));
       }
     });
@@ -575,22 +680,39 @@
     return fields.slice(0, 120);
   }
 
-  function fieldFromExpression(expression) {
+  function buildSourceAliasMap(root) {
+    const map = new Map();
+
+    walk(root, (node) => {
+      if (!node || typeof node !== "object" || !Array.isArray(node.From)) return;
+      for (const source of node.From) {
+        if (source?.Name && source?.Entity) {
+          map.set(String(source.Name), String(source.Entity));
+        }
+      }
+    });
+
+    return map;
+  }
+
+  function fieldFromExpression(expression, aliasMap = new Map()) {
     const expressionRoot = expression.Expression || expression;
     const directColumn = expression.Expression?.Column || expression.Column;
     const directMeasure = expression.Expression?.Measure || expression.Measure;
     const directHierarchy = expression.Expression?.Hierarchy || expression.Hierarchy;
 
-    if (directColumn && directColumn !== expression) return fieldFromExpression(directColumn);
-    if (directMeasure && directMeasure !== expression) return fieldFromExpression(directMeasure);
-    if (directHierarchy && directHierarchy !== expression) return fieldFromExpression(directHierarchy);
+    if (directColumn && directColumn !== expression) return fieldFromExpression(directColumn, aliasMap);
+    if (directMeasure && directMeasure !== expression) return fieldFromExpression(directMeasure, aliasMap);
+    if (directHierarchy && directHierarchy !== expression) return fieldFromExpression(directHierarchy, aliasMap);
+
+    const rawTable =
+      expressionRoot.SourceRef?.Entity ||
+      expressionRoot.SourceRef?.Source ||
+      expression.Entity ||
+      findFirstScalar(expressionRoot, ["Entity"]);
 
     return {
-      table:
-        expressionRoot.SourceRef?.Entity ||
-        expressionRoot.SourceRef?.Source ||
-        expression.Entity ||
-        findFirstScalar(expressionRoot, ["Entity"]),
+      table: aliasMap.get(String(rawTable)) || rawTable,
       name:
         expression.Property ||
         expression.Name ||
@@ -1230,10 +1352,19 @@
     return null;
   }
 
+  function findJsonPath(jsonByPath, target) {
+    for (const [path, json] of jsonByPath.entries()) {
+      if (json === target) return path;
+    }
+    return null;
+  }
+
   function classifyFile(path) {
     const lower = path.toLowerCase();
     if (lower.endsWith(".pbip")) return "PBIP";
     if (lower.endsWith(".pbir")) return "PBIR";
+    if (lower.endsWith(".pbism")) return "PBISM";
+    if (lower.endsWith(".bim")) return "BIM";
     if (lower.endsWith(".tmdl")) return "TMDL";
     if (lower.endsWith(".platform")) return "Platform";
     if (lower.endsWith("/page.json")) return "Page";
@@ -1248,6 +1379,8 @@
     return (
       lower.endsWith(".pbip") ||
       lower.endsWith(".pbir") ||
+      lower.endsWith(".pbism") ||
+      lower.endsWith(".bim") ||
       lower.endsWith(".json") ||
       lower.endsWith(".tmdl") ||
       lower.endsWith(".platform") ||
@@ -1260,6 +1393,8 @@
     return (
       lower.endsWith(".pbip") ||
       lower.endsWith(".pbir") ||
+      lower.endsWith(".pbism") ||
+      lower.endsWith(".bim") ||
       lower.endsWith(".json") ||
       lower.endsWith(".platform")
     );
@@ -1462,6 +1597,20 @@
       text = text.slice(1, -1).replace(/\\"/g, '"');
     }
     return text;
+  }
+
+  function parseEmbeddedJson(value) {
+    if (value && typeof value === "object") return value;
+    if (typeof value !== "string") return null;
+
+    const text = stripBom(value).trim();
+    if (!text) return null;
+
+    try {
+      return JSON.parse(text);
+    } catch {
+      return null;
+    }
   }
 
   function cleanFieldName(value) {

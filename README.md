@@ -10,7 +10,17 @@ No uploaded file is sent to a server.
 
 - A PBIP project folder selected with **フォルダを開く**
 - A zip archive containing a PBIP project
-- Individual `.pbip`, `.pbir`, `.json`, `.tmdl`, and `.platform` files
+- Individual `.pbip`, `.pbir`, `.pbism`, `.bim`, `.json`, `.tmdl`, and `.platform` files
+
+For a PBIP project that looks like this, select the parent folder with
+**フォルダを開く**:
+
+```text
+Project Folder/
+  MyReport.Report/
+  MyReport.SemanticModel/
+  MyReport.pbip
+```
 
 ## What it can show
 
@@ -18,6 +28,7 @@ No uploaded file is sent to a server.
 - `.Report/definition/pages/*/visuals/*/visual.json`
 - `.Report/definition.pbir`
 - `.Report/definition/report.json`
+- `.Report/report.json`
 - `.SemanticModel/definition/**/*.tmdl`
 - Legacy `model.bim` tables when present
 
