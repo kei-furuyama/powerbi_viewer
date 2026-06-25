@@ -2497,7 +2497,20 @@
 
     const data = visual.data;
 
-    if (type.includes("card") || type.includes("kpi") || type.includes("gauge") || type.includes("multirowcard")) {
+    if (type.includes("treemap")) {
+      return renderTreemap(data, theme, categoryLabel, valueLabel);
+    }
+
+    if (type.includes("scatter") || type.includes("bubble")) {
+      return renderScatter(data, theme);
+    }
+
+    if (type.includes("gauge")) {
+      const valueText = data?.kind === "card" ? data.text : "—";
+      return renderGauge(valueText, valueLabel, color);
+    }
+
+    if (type.includes("card") || type.includes("kpi") || type.includes("multirowcard")) {
       const valueText = data?.kind === "card" ? data.text : "—";
       const label = (data?.kind === "card" && data.label) || valueLabel;
       const card = visual.style?.card || {};
@@ -2542,7 +2555,7 @@
       return `<div class="mini-pie-wrap legend-${escapeAttribute(showLegend ? position : "none")}">${pieHtml}${legend}</div>`;
     }
 
-    if (type.includes("bar") || type.includes("column") || type.includes("histogram") || type.includes("funnel") || type.includes("waterfall")) {
+    if (type.includes("bar") || type.includes("column") || type.includes("histogram") || type.includes("funnel") || type.includes("waterfall") || type.includes("ribbon")) {
       const horizontal = type.includes("bar") && !type.includes("column");
       if (data?.kind === "category" && data.series.length) {
         const showLabels = visual.style?.dataLabels?.show !== false;
@@ -2667,6 +2680,56 @@
       })
       .join("");
     return `<div class="${horizontal ? "hbars" : "vbars"}">${bars}</div>`;
+  }
+
+  function renderTreemap(data, theme, categoryLabel, valueLabel) {
+    const series = data?.kind === "category" ? data.series.filter((point) => point.value > 0) : [];
+    if (!series.length) {
+      return `<div class="mini-treemap" aria-hidden="true">${[40, 26, 18, 16]
+        .map((flex, index) => `<span style="flex:${flex};background:${escapeAttribute(theme[index % theme.length])}"></span>`)
+        .join("")}</div>`;
+    }
+    const total = series.reduce((sum, point) => sum + point.value, 0) || 1;
+    const tiles = series
+      .map((point, index) => {
+        const pct = (point.value / total) * 100;
+        const valueText = formatMeasureValue(point.value, data.format);
+        return `<span class="treemap-tile" style="flex:${point.value};background:${escapeAttribute(theme[index % theme.length])}" title="${escapeAttribute(`${point.label}: ${valueText}`)}">
+          <b>${escapeHtml(point.label)}</b><i>${escapeHtml(valueText)}</i>
+        </span>`;
+      })
+      .join("");
+    return `<div class="mini-treemap labeled">${tiles}</div>`;
+  }
+
+  function renderScatter(data, theme) {
+    const series = data?.kind === "category" ? data.series : [];
+    const max = data?.max || 1;
+    // 値の大小で点の位置・サイズを散らす(擬似配置)
+    const dots = (series.length ? series : Array.from({ length: 6 }, (_, i) => ({ value: (i + 1) * (max / 6), label: "" })))
+      .slice(0, 16)
+      .map((point, index) => {
+        const ratio = Math.max(0.05, Math.min(1, Math.abs(point.value) / max));
+        const x = 8 + ((index * 37) % 84);
+        const y = 88 - ratio * 78;
+        const size = 6 + ratio * 8;
+        return `<span style="left:${x}%;top:${y.toFixed(0)}%;width:${size.toFixed(0)}px;height:${size.toFixed(0)}px;background:${escapeAttribute(theme[index % theme.length])}" title="${escapeAttribute(point.label || "")}"></span>`;
+      })
+      .join("");
+    return `<div class="mini-scatter" aria-hidden="true">${dots}</div>`;
+  }
+
+  function renderGauge(valueText, label, color) {
+    return `
+      <div class="mini-gauge">
+        <svg viewBox="0 0 100 56" preserveAspectRatio="xMidYMid meet" aria-hidden="true">
+          <path d="M6 50 A44 44 0 0 1 94 50" fill="none" stroke="#e7e2d8" stroke-width="10" stroke-linecap="round" />
+          <path d="M6 50 A44 44 0 0 1 72 14" fill="none" stroke="${escapeAttribute(color)}" stroke-width="10" stroke-linecap="round" />
+        </svg>
+        <div class="mini-gauge-value">${escapeHtml(valueText)}</div>
+        <div class="mini-card-label">${escapeHtml(label)}</div>
+      </div>
+    `;
   }
 
   function linePath(series, max) {
