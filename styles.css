@@ -669,6 +669,51 @@ select {
   border-radius: 2px;
 }
 
+/* クロスフィルタ: クリック可能なマークと選択状態 */
+[data-xf-val] {
+  cursor: pointer;
+}
+
+.mini-slicer-items .slicer-row.xf-active {
+  color: var(--accent-strong);
+  font-weight: 700;
+}
+
+.mini-slicer-items .slicer-row.xf-active i {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.chip-item.xf-active {
+  border-color: var(--accent);
+  background: rgba(0, 124, 114, 0.12);
+  color: var(--accent-strong);
+  font-weight: 600;
+}
+
+.xf-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 8px;
+  padding: 2px 8px;
+  border: 1px solid var(--accent);
+  border-radius: 999px;
+  background: rgba(0, 124, 114, 0.08);
+  color: var(--accent-strong);
+  font-size: 0.8rem;
+}
+
+.xf-clear {
+  border: none;
+  background: var(--accent);
+  color: white;
+  border-radius: 999px;
+  padding: 1px 8px;
+  font-size: 0.72rem;
+  cursor: pointer;
+}
+
 /* 横向きスライサー: チップ列 */
 .mini-slicer.horizontal .mini-slicer-items {
   display: flex;

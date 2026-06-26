@@ -1158,3 +1158,23 @@ console.log("relationship + time intelligence DAX smoke test passed");
 }
 
 console.log("model analysis (RLS/calc/refresh/BPA) smoke test passed");
+
+// --- Phase 4: slicer carries table/column for cross-filtering ---
+{
+  const slField = { Column: { Expression: { SourceRef: { Entity: "売上" } }, Property: "地域" } };
+  const slVisual = { name: "sl", position: { x: 0, y: 0, width: 200, height: 300, z: 0 }, visual: { visualType: "slicer", query: { queryState: { Values: { projections: [{ field: slField, queryRef: "売上.地域" }] } } } } };
+  const xfTmdl = ["table 売上", "\tcolumn 地域", "\t\tdataType: string", "\tcolumn 金額", "\t\tdataType: int64", "\tmeasure 合計 = SUM(売上[金額])", "\tpartition 売上 = m", "\t\tsource =", "\t\t\tlet Source = Table.FromRows({ {\"東\",300},{\"西\",100},{\"南\",250} }, type table [地域 = text, 金額 = Int64.Type]) in Source"].join("\n");
+  const xfProj = analyzeProject([
+    { path: "XF.Report/definition/pages/p/visuals/sl/visual.json", text: JSON.stringify(slVisual), size: 200 },
+    { path: "XF.Report/definition/pages/p/page.json", text: JSON.stringify({ name: "p", displayName: "P", width: 1280, height: 720 }), size: 80 },
+    { path: "XF.Report/definition/pages/pages.json", text: JSON.stringify({ pageOrder: ["p"], activePageName: "p" }), size: 60 },
+    { path: "XF.SemanticModel/definition/tables/売上.tmdl", text: xfTmdl, size: 320 },
+  ], []);
+  const slData = xfProj.report.visuals.find((v) => v.type.toLowerCase().includes("slicer"))?.data;
+  assert.ok(slData && slData.kind === "slicer", "スライサーのデータが生成される");
+  assert.equal(slData.table, "売上", "スライサーが対象テーブルを保持");
+  assert.equal(slData.column, "地域", "スライサーが対象列を保持");
+  assert.deepEqual(slData.items.sort(), ["東", "西", "南"].sort(), "スライサー項目が一意な値");
+}
+
+console.log("slicer cross-filter data smoke test passed");

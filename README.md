@@ -5,6 +5,10 @@ PBIP Viewer is a static browser app for inspecting Power BI Project files.
 It reads PBIP/PBIR project metadata in the browser and renders an approximate
 report canvas, visual inventory, file inventory, and semantic model explorer.
 
+Slicers on the canvas are **interactive**: click an item to cross-filter the
+other visuals on the page (propagated across table relationships); click again
+or use **クリア** to reset.
+
 ## Privacy
 
 All processing happens **locally in your browser**. The files you open are

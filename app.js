@@ -7,6 +7,7 @@
     activeTab: "canvas",
     selectedPageId: null,
     selectedVisualId: null,
+    crossFilter: null, // { table, column, value, visualId } — クロスフィルタ選択
   };
 
   const els = {};
@@ -3602,6 +3603,42 @@
     return { value: aggregate(records, columnName, field.agg), format: "" };
   }
 
+  // ページのクロスフィルタ選択を、対象ビジュアルのレコードに適用(同テーブルは直接、別テーブルはリレーション経由)
+  function applyCrossFilter(records, table, dataModel, visual) {
+    const xf = state.crossFilter;
+    if (!xf || !xf.table || xf.visualId === visual.id) return records;
+    if (normalizeName(table.name) === normalizeName(xf.table)) {
+      const col = resolveColumn(table, xf.column);
+      if (!col) return records;
+      return records.filter((r) => String(r[col] ?? "") === String(xf.value));
+    }
+    // 別テーブル: リレーションで結合キーをたどって絞り込む
+    const model = dataModel.byName;
+    const xfTable = model.get(xf.table) || model.get(normalizeName(xf.table));
+    if (!xfTable) return records;
+    const ft = normalizeName(table.name);
+    const xt = normalizeName(xf.table);
+    const rel = (model.relationships || []).find((r) => {
+      const a = normalizeName(r.fromTable);
+      const b = normalizeName(r.toTable);
+      return (a === ft && b === xt) || (a === xt && b === ft);
+    });
+    if (!rel) return records;
+    const factIsFrom = normalizeName(rel.fromTable) === ft;
+    const factKey = resolveColumn(table, factIsFrom ? rel.fromColumn : rel.toColumn);
+    const dimKeyCol = resolveColumn(xfTable, factIsFrom ? rel.toColumn : rel.fromColumn);
+    const dimValCol = resolveColumn(xfTable, xf.column);
+    if (!factKey || !dimKeyCol || !dimValCol) return records;
+    const keys = new Set(xfTable.records.filter((r) => String(r[dimValCol] ?? "") === String(xf.value)).map((r) => String(r[dimKeyCol] ?? "")));
+    return records.filter((r) => keys.has(String(r[factKey] ?? "")));
+  }
+
+  // 選択中のクロスフィルタが指定の table/column/value と一致するか
+  function isCrossFilterActive(tableName, column, value) {
+    const xf = state.crossFilter;
+    return Boolean(xf && normalizeName(xf.table) === normalizeName(tableName) && normalizeName(xf.column) === normalizeName(column) && String(xf.value) === String(value));
+  }
+
   function computeVisualData(visual, dataModel) {
     const categories = roleFieldsByKind(visual, "category");
     const values = roleFieldsByKind(visual, "value");
@@ -3612,8 +3649,8 @@
     if (!table) return null;
     const model = dataModel.byName;
 
-    // ビジュアルレベルフィルタを filter context として適用
-    const records = applyVisualFilters(table.records, visual.filters, table);
+    // ビジュアルレベルフィルタ + ページのクロスフィルタ選択を filter context として適用
+    const records = applyCrossFilter(applyVisualFilters(table.records, visual.filters, table), table, dataModel, visual);
 
     const valueField = values[0];
     const categoryField = categories[0];
@@ -3685,16 +3722,19 @@
 
     // スライサー
     if (type.includes("slicer")) {
+      // スライサーのフィールドはロールに依らず最初の非メジャー列
+      const slField = [...categories, ...values].find((f) => f.kind !== "measure" && f.kind !== "aggregation") || categoryField || valueField;
+      const slCol = slField ? resolveColumn(table, slField.name) : null;
       const items = [];
       const seen = new Set();
       for (const record of records) {
-        const text = String(categoryColumn ? record[categoryColumn] ?? "" : "").trim();
+        const text = String(slCol ? record[slCol] ?? "" : "").trim();
         if (!text || seen.has(text)) continue;
         seen.add(text);
         items.push(text);
         if (items.length >= 14) break;
       }
-      return { kind: "slicer", field: categoryField?.display || "", items };
+      return { kind: "slicer", field: slField?.display || "", table: table.name, column: slField?.name || "", items };
     }
 
     // マルチ行カード: 各メジャーを1行ずつ表示
@@ -3997,7 +4037,11 @@
     const canvasWidthPx = els.reportCanvas.clientWidth || 1120;
     const fontScale = canvasWidthPx / (page.width || DEFAULT_PAGE.width);
 
+    // クロスフィルタ選択を反映するため、描画時にデータを再計算(state.crossFilterを参照)
+    const dataModel = state.project?.semantic ? buildDataModel(state.project.semantic) : null;
+
     for (const visual of page.visuals) {
+      if (dataModel && dataModel.byName.size) visual.data = computeVisualData(visual, dataModel);
       const style = visual.style || {};
       const box = document.createElement("button");
       box.type = "button";
@@ -4060,7 +4104,32 @@
         state.selectedVisualId = visual.id;
         renderCanvas();
       });
+      // クロスフィルタ: スライサー等のマークをクリックでページを絞り込む(再帰再描画)
+      box.querySelectorAll("[data-xf-val]").forEach((el) => {
+        el.addEventListener("click", (event) => {
+          event.stopPropagation();
+          const t = el.getAttribute("data-xf-table");
+          const c = el.getAttribute("data-xf-col");
+          const v = el.getAttribute("data-xf-val");
+          const vis = el.getAttribute("data-xf-vis");
+          const cur = state.crossFilter;
+          if (cur && cur.table === t && cur.column === c && String(cur.value) === v) state.crossFilter = null;
+          else state.crossFilter = { table: t, column: c, value: v, visualId: vis };
+          renderCanvas();
+        });
+      });
       els.reportCanvas.append(box);
+    }
+
+    // アクティブなクロスフィルタの表示＋クリア
+    if (state.crossFilter) {
+      const xf = state.crossFilter;
+      const meta = document.createElement("span");
+      meta.className = "xf-indicator";
+      meta.innerHTML = `クロスフィルタ: <b>${escapeHtml(xf.column)} = ${escapeHtml(String(xf.value))}</b> <button type="button" class="xf-clear">クリア ✕</button>`;
+      meta.querySelector(".xf-clear").addEventListener("click", () => { state.crossFilter = null; renderCanvas(); });
+      els.canvasMeta.append(" ");
+      els.canvasMeta.append(meta);
     }
 
     renderInspector(page);
@@ -4237,9 +4306,16 @@
       const horizontal = sl.orientation === "horizontal";
       const head = sl.headerShow === false ? "" : `<span class="mini-slicer-head">${escapeHtml(sl.headerText || categoryLabel || "Slicer")}</span>`;
       const limit = horizontal ? 8 : 6;
-      const cells = items.slice(0, limit).map((item) =>
-        horizontal ? `<span class="chip-item">${escapeHtml(item)}</span>` : `<span><i></i>${escapeHtml(item)}</span>`,
-      ).join("");
+      const interactive = Boolean(data?.kind === "slicer" && data.table && data.column);
+      const cells = items.slice(0, limit).map((item) => {
+        const attrs = interactive
+          ? ` data-xf-vis="${escapeAttribute(visual.id)}" data-xf-table="${escapeAttribute(data.table)}" data-xf-col="${escapeAttribute(data.column)}" data-xf-val="${escapeAttribute(item)}"`
+          : "";
+        const sel = interactive && isCrossFilterActive(data.table, data.column, item) ? " xf-active" : "";
+        return horizontal
+          ? `<span class="chip-item${sel}"${attrs}>${escapeHtml(item)}</span>`
+          : `<span class="slicer-row${sel}"${attrs}><i></i>${escapeHtml(item)}</span>`;
+      }).join("");
       return `<div class="mini-slicer ${horizontal ? "horizontal" : ""}">${head}<div class="mini-slicer-items">${cells}</div></div>`;
     }
 
