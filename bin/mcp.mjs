@@ -21,6 +21,19 @@ function asText(value) {
   return { content: [{ type: "text", text }] };
 }
 
+// Wrap a handler so any thrown error becomes a clean isError result (with an
+// actionable message) instead of a raw protocol-level exception.
+function safe(handler) {
+  return async (args) => {
+    try {
+      return await handler(args);
+    } catch (err) {
+      const message = err?.message || String(err);
+      return { content: [{ type: "text", text: `エラー: ${message}` }], isError: true };
+    }
+  };
+}
+
 const server = new McpServer({ name: "pbip-viewer", version: "1.0.0" });
 
 server.registerTool(
@@ -35,10 +48,10 @@ server.registerTool(
       includeRaw: z.boolean().optional().describe("生データ(ファイル本文/画像dataURL)も含めるか。既定 false"),
     },
   },
-  async ({ path: inputPath, includeRaw }) => {
+  safe(async ({ path: inputPath, includeRaw }) => {
     const { project } = await loadProject(inputPath);
     return asText(trimProject(project, { raw: Boolean(includeRaw) }));
-  },
+  }),
 );
 
 server.registerTool(
@@ -52,7 +65,7 @@ server.registerTool(
       path: z.string().describe("PBIP プロジェクトフォルダ、または .zip ファイルへのパス"),
     },
   },
-  async ({ path: inputPath }) => {
+  safe(async ({ path: inputPath }) => {
     const { project } = await loadProject(inputPath);
     const v = project.validation || { errors: 0, warnings: 0, problems: [] };
     return asText({
@@ -62,7 +75,7 @@ server.registerTool(
       problems: v.problems || [],
       summary: summarize(project),
     });
-  },
+  }),
 );
 
 server.registerTool(
@@ -76,15 +89,30 @@ server.registerTool(
       outPath: z.string().optional().describe("出力先HTMLパス。省略時は <name>-preview.html"),
     },
   },
-  async ({ path: inputPath, outPath }) => {
-    const { entries } = await loadProject(inputPath);
+  safe(async ({ path: inputPath, outPath }) => {
+    // Rendering only needs the raw entries (the browser re-analyzes at runtime),
+    // so skip the analysis pass and stay decoupled from it.
+    const { entries } = await readEntries(inputPath);
     const name = projectBaseName(inputPath);
     const out = path.resolve(outPath || `${name}-preview.html`);
     const html = await buildSelfContainedHtml(entries, { title: `${name} — PBIP Viewer` });
     await fsp.writeFile(out, html);
     return asText({ outPath: out, bytes: html.length });
-  },
+  }),
 );
 
-const transport = new StdioServerTransport();
-await server.connect(transport);
+// stdout is the JSON-RPC channel; all diagnostics must go to stderr only.
+process.on("uncaughtException", (err) => {
+  process.stderr.write(`pbip-viewer-mcp 未捕捉エラー: ${err?.stack || err}\n`);
+});
+process.on("unhandledRejection", (err) => {
+  process.stderr.write(`pbip-viewer-mcp 未処理のPromise拒否: ${err?.stack || err}\n`);
+});
+
+try {
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+} catch (err) {
+  process.stderr.write(`pbip-viewer-mcp の起動に失敗しました: ${err?.message || err}\n`);
+  process.exit(1);
+}

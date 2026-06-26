@@ -14,6 +14,18 @@ function ok(cond, msg) {
   pass += 1;
 }
 
+async function assertRejects(fn, re, msg) {
+  let threw = null;
+  try {
+    await fn();
+  } catch (err) {
+    threw = err;
+  }
+  assert.ok(threw, `${msg} — エラーが投げられなかった`);
+  assert.ok(re.test(threw.message), `${msg} — メッセージ不一致: ${threw.message}`);
+  pass += 1;
+}
+
 // --- Minimal valid PBIP fixture -------------------------------------------
 async function writeFixture(root, { breakJson = false } = {}) {
   const reportDir = path.join(root, "Demo.Report");
@@ -133,6 +145,33 @@ async function main() {
   ok(html.includes("PBIPViewerParser"), "HTML に app.js が埋め込まれている");
   ok(html.includes("loadEntriesForPreview"), "HTML が自動ブートストラップする");
   ok(!/<script src="https:\/\/[^"]*jszip/i.test(html), "JSZip CDN 行が除去されている");
+
+  // 5b) self-contained HTML carries exactly one (offline) CSP and survives '$' titles.
+  ok((html.match(/Content-Security-Policy/g) || []).length === 1, "CSP メタは1つだけ");
+  ok(html.includes("default-src 'none'"), "オフライン用CSPが入っている");
+  const dollarHtml = await buildSelfContainedHtml(entries, { title: "Q4$&$`<x>" });
+  ok(dollarHtml.includes("Q4$&amp;$`&lt;x&gt;"), "タイトルの $ パターンが壊れずエスケープされている");
+
+  // 6) error handling: clear, thrown errors for bad inputs (agent/CLI surface).
+  await assertRejects(() => readEntries(path.join(base, "does-not-exist")),
+    /パスが見つかりません/, "存在しないパスは明確に失敗する");
+  const emptyDir = path.join(base, "empty");
+  await fsp.mkdir(emptyDir, { recursive: true });
+  await assertRejects(() => readEntries(emptyDir),
+    /読み取れるファイル/, "空フォルダは『読み取れるファイルなし』で失敗する");
+  await assertRejects(() => readEntries(""),
+    /パスが指定されていません/, "空文字パスは明確に失敗する");
+  const fakeZip = path.join(base, "broken.zip");
+  await fsp.writeFile(fakeZip, "this is not a zip");
+  await assertRejects(() => readEntries(fakeZip),
+    /zipを展開できません/, "壊れたzipは明確に失敗する");
+
+  // 6b) a non-PBIP folder still loads but warns (doesn't throw if it has files).
+  const notPbip = path.join(base, "notpbip");
+  await fsp.mkdir(notPbip, { recursive: true });
+  await fsp.writeFile(path.join(notPbip, "notes.txt"), "hello");
+  const np = await readEntries(notPbip);
+  ok(np.issues.some((i) => /PBIPらしき/.test(i.title)), "PBIPらしくないフォルダは警告を出す");
 
   await fsp.rm(base, { recursive: true, force: true });
   console.log(`cli-smoke: ${pass} checks passed`);

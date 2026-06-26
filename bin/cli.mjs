@@ -23,13 +23,29 @@ const HELP = `pbip-viewer — Power BI Project (PBIP) を解析・検査・プ�
   pbip-viewer html ./MyReport -o preview.html
 `;
 
+const ALLOWED_FLAGS = {
+  analyze: new Set(["json", "raw", "pretty", "help"]),
+  check: new Set(["json", "help"]),
+  html: new Set(["out", "help"]),
+};
+
 function parseArgs(argv) {
-  const args = { _: [], flags: {} };
+  const args = { _: [], flags: {}, errors: [] };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
-    if (a === "-o" || a === "--out") args.flags.out = argv[++i];
-    else if (a.startsWith("--")) args.flags[a.slice(2)] = true;
-    else args._.push(a);
+    if (a === "-h" || a === "--help" || a === "help") {
+      args.flags.help = true;
+    } else if (a === "-o" || a === "--out") {
+      const next = argv[i + 1];
+      if (next === undefined || next.startsWith("-")) args.errors.push("-o/--out にはファイル名が必要です。");
+      else args.flags.out = argv[++i];
+    } else if (a.startsWith("--")) {
+      const eq = a.indexOf("=");
+      if (eq !== -1) args.flags[a.slice(2, eq)] = a.slice(eq + 1);
+      else args.flags[a.slice(2)] = true;
+    } else {
+      args._.push(a);
+    }
   }
   return args;
 }
@@ -47,7 +63,28 @@ async function main() {
     process.stdout.write(HELP);
     return;
   }
-  const { _, flags } = parseArgs(argv.slice(1));
+  if (!ALLOWED_FLAGS[cmd]) {
+    process.stderr.write(`不明なコマンド: ${cmd}\n\n` + HELP);
+    process.exitCode = 2;
+    return;
+  }
+
+  const { _, flags, errors } = parseArgs(argv.slice(1));
+
+  // `<command> --help` (help anywhere after the command) prints usage with code 0.
+  if (flags.help) {
+    process.stdout.write(HELP);
+    return;
+  }
+
+  for (const err of errors) process.stderr.write(err + "\n");
+  const unknown = Object.keys(flags).filter((f) => !ALLOWED_FLAGS[cmd].has(f));
+  for (const f of unknown) process.stderr.write(`不明なオプション: --${f}\n`);
+  if (errors.length || unknown.length) {
+    process.exitCode = 2;
+    return;
+  }
+
   const inputPath = _[0];
   if (!inputPath) {
     process.stderr.write("パスを指定してください。\n\n" + HELP);
@@ -89,12 +126,10 @@ async function main() {
     process.stdout.write(`書き出しました: ${path.resolve(outPath)} (${html.length} bytes)\nブラウザで開いてください。\n`);
     return;
   }
-
-  process.stderr.write(`不明なコマンド: ${cmd}\n\n` + HELP);
-  process.exitCode = 2;
 }
 
 main().catch((err) => {
   process.stderr.write(`エラー: ${err?.message || err}\n`);
+  if (process.env.PBIP_DEBUG && err?.stack) process.stderr.write(err.stack + "\n");
   process.exitCode = 1;
 });
