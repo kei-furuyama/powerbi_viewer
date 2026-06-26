@@ -657,6 +657,40 @@ assert.equal(cfBar.style.dataPointRule.stops[0].value, undefined, "no fixed stop
 
 console.log("conditional formatting smoke test passed");
 
+// --- テーブル: メジャー列の行ごと評価 + 合計 ---
+const mtTmdl = [
+  "table 売上",
+  "\tmeasure 売上合計 = SUM('売上'[金額])",
+  "\t\tformatString: #,0\"円\"",
+  "\tmeasure 件数 = COUNTROWS('売上')",
+  "\tcolumn 地域", "\t\tdataType: string",
+  "\tcolumn 金額", "\t\tdataType: int64",
+  "\tpartition 売上 = m", "\t\tsource =",
+  "\t\t\tlet Source = Table.FromRows({ {\"東\",1200},{\"東\",800},{\"西\",1500},{\"北\",2000} }, type table [地域=text, 金額=Int64.Type]) in Source",
+].join("\n");
+const mtM = (p) => ({ field: { Measure: { Expression: { SourceRef: { Entity: "売上" } }, Property: p } }, queryRef: "売上." + p, nativeQueryRef: p });
+const mtC = (p) => ({ field: { Column: { Expression: { SourceRef: { Entity: "売上" } }, Property: p } }, queryRef: "売上." + p, nativeQueryRef: p });
+const mtProject = analyzeProject(
+  [
+    { path: "MT.pbip", text: JSON.stringify({ version: "1.0", artifacts: [{ report: { path: "MT.Report" } }] }), size: 40 },
+    { path: "MT.Report/definition/pages/pages.json", text: JSON.stringify({ pageOrder: ["P"] }), size: 30 },
+    { path: "MT.Report/definition/pages/P/page.json", text: JSON.stringify({ name: "P", displayName: "P", width: 1280, height: 720 }), size: 60 },
+    { path: "MT.Report/definition/pages/P/visuals/t/visual.json", text: JSON.stringify({ name: "t", position: { x: 0, y: 0, width: 600, height: 300, z: 0 }, visual: { visualType: "tableEx", objects: { total: [{ properties: { show: { expr: { Literal: { Value: "true" } } } } }] }, query: { queryState: { Rows: { projections: [mtC("地域")] }, Values: { projections: [mtM("売上合計"), mtM("件数")] } } } } }), size: 200 },
+    { path: "MT.SemanticModel/definition/tables/売上.tmdl", text: mtTmdl, size: 300 },
+  ],
+  [],
+);
+const mtT = mtProject.report.pages[0].visuals.find((v) => v.id === "t").data;
+assert.deepEqual(mtT.columns, ["地域", "売上合計", "件数"], "measure columns kept in table");
+assert.deepEqual(mtT.numericCol, [false, true, true], "measure columns are numeric (right-aligned)");
+const tokyo = mtT.rows.find((r) => r[0] === "東");
+assert.equal(tokyo[1], "2,000円", "per-row measure with formatString (東: 1200+800)");
+assert.equal(tokyo[2], "2", "per-row COUNTROWS for 東");
+assert.equal(mtT.totals[1], "5,500円", "grand total measure (1200+800+1500+2000)");
+assert.equal(mtT.totals[2], "4", "grand total count");
+
+console.log("measure-table smoke test passed");
+
 const legacyReportConfig = {
   name: "legacy_donut",
   layouts: [

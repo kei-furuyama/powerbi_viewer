@@ -2620,17 +2620,66 @@
 
     // テーブル / マトリックス
     if (type.includes("table") || type.includes("pivot") || type.includes("matrix")) {
-      const plain = [...categories, ...values].filter((field) => field.kind !== "measure");
-      const columnNames = plain.map((field) => resolveColumn(table, field.name) || field.name);
-      const shown = records.slice(0, 8);
-      const rows = shown.map((record) => columnNames.map((name) => formatCell(record[name])));
-      // 条件付き書式用に生の数値も保持
-      const rawRows = shown.map((record) => columnNames.map((name) => (record[name] != null && record[name] !== "" && Number.isFinite(Number(record[name])) ? Number(record[name]) : null)));
-      // 数値列は合計を算出(合計行表示用)
-      const numericCol = columnNames.map((name) => records.some((r) => r[name] != null && r[name] !== "") && records.every((r) => r[name] == null || r[name] === "" || Number.isFinite(Number(r[name]))));
-      const colDomains = columnNames.map((name, i) => (numericCol[i] ? seriesDomain(records.map((r) => r[name])) : null));
-      const totals = columnNames.map((name, i) => (numericCol[i] ? groupThousands(roundTo(records.reduce((s, r) => s + (Number(r[name]) || 0), 0), 2)) : ""));
-      return { kind: "table", columns: plain.map((field) => field.display), rows, rawRows, numericCol, colDomains, totals, hasNumeric: numericCol.some(Boolean), total: records.length };
+      const catFields = [...categories, ...values].filter((field) => field.kind !== "measure");
+      const measureFields = [...categories, ...values].filter((field) => field.kind === "measure");
+      const allFields = [...catFields, ...measureFields];
+      const catColumns = catFields.map((field) => resolveColumn(table, field.name) || field.name);
+
+      // 行 = カテゴリ列の組み合わせでグルーピング(メジャーは各行コンテキストで評価)
+      const groupMap = new Map();
+      const orderedKeys = [];
+      for (const record of records) {
+        const key = catColumns.length ? catColumns.map((c) => String(record[c] ?? "")).join("") : "__all__";
+        if (!groupMap.has(key)) { groupMap.set(key, []); orderedKeys.push(key); }
+        groupMap.get(key).push(record);
+      }
+      const rowGroups = (catColumns.length ? orderedKeys : ["__all__"]).map((k) => groupMap.get(k) || records);
+      const ROW_LIMIT = 10;
+      const shown = rowGroups.slice(0, ROW_LIMIT);
+
+      const evalCache = (recs) => allFields.map((field) => {
+        if (field.kind === "measure") {
+          const ev = evaluateField(field, recs, table, model);
+          const value = ev ? Number(ev.value) : null;
+          return { text: ev ? formatMeasureValue(ev.value, ev.format) : "", raw: Number.isFinite(value) ? value : null };
+        }
+        const col = resolveColumn(table, field.name) || field.name;
+        const cell = recs[0]?.[col];
+        const num = cell != null && cell !== "" && Number.isFinite(Number(cell)) ? Number(cell) : null;
+        return { text: formatCell(cell), raw: num };
+      });
+
+      const cells = shown.map(evalCache);
+      const rows = cells.map((r) => r.map((c) => c.text));
+      const rawRows = cells.map((r) => r.map((c) => c.raw));
+
+      // 列が数値か(メジャーは数値、カテゴリ列は全数値なら数値)
+      const numericCol = allFields.map((field, i) => {
+        if (field.kind === "measure") return true;
+        const col = catColumns[i];
+        return records.some((r) => r[col] != null && r[col] !== "") && records.every((r) => r[col] == null || r[col] === "" || Number.isFinite(Number(r[col])));
+      });
+      const colDomains = allFields.map((_, i) => (numericCol[i] ? seriesDomain(rawRows.map((r) => r[i])) : null));
+
+      // 合計行: メジャーは全レコードで評価、数値カテゴリ列は合計
+      const totals = allFields.map((field, i) => {
+        if (field.kind === "measure") {
+          const ev = evaluateField(field, records, table, model);
+          return ev ? formatMeasureValue(ev.value, ev.format) : "";
+        }
+        if (numericCol[i]) return groupThousands(roundTo(records.reduce((s, r) => s + (Number(r[catColumns[i]]) || 0), 0), 2));
+        return "";
+      });
+
+      return {
+        kind: "table",
+        columns: allFields.map((field) => field.display),
+        rows, rawRows, numericCol, colDomains, totals,
+        hasNumeric: numericCol.some(Boolean),
+        total: rowGroups.length,
+        moreRows: Math.max(0, rowGroups.length - shown.length),
+        colCount: allFields.length,
+      };
     }
 
     // スライサー
@@ -3133,36 +3182,45 @@
       const columns = data?.kind === "table" ? data.columns : [...categories, ...values].map((field) => field.display);
       if (columns.length) {
         const ts = visual.style?.table || {};
-        const maxCols = 6;
-        const headStyle = [
+        const maxCols = 7;
+        const numericCol = data?.numericCol || [];
+        const alignOf = (ci) => (numericCol[ci] ? "text-align:right" : "");
+        const headStyle = (ci) => [
           ts.headerColor ? `color:${escapeAttribute(ts.headerColor)}` : "",
           ts.headerBack ? `background:${escapeAttribute(ts.headerBack)}` : "",
           ts.headerBold ? "font-weight:700" : "",
+          alignOf(ci),
         ].filter(Boolean).join(";");
-        const bodyStyle = ts.fontColor ? `color:${escapeAttribute(ts.fontColor)}` : "";
-        const head = columns.slice(0, maxCols).map((name) => `<th style="${headStyle}">${escapeHtml(name)}</th>`).join("");
+        const bodyColor = ts.fontColor ? `color:${escapeAttribute(ts.fontColor)}` : "";
+        const head = columns.slice(0, maxCols).map((name, ci) => `<th style="${headStyle(ci)}">${escapeHtml(name)}</th>`).join("");
         const banded = ts.bandPrimary || ts.bandSecondary;
         const cf = ts.backRule || ts.fontRule; // 条件付き書式
         const rows = data?.kind === "table" && data.rows.length
-          ? data.rows.slice(0, 6).map((row, ri) => {
+          ? data.rows.map((row, ri) => {
               const band = banded ? `background:${escapeAttribute((ri % 2 ? ts.bandSecondary : ts.bandPrimary) || "")}` : "";
               return `<tr style="${band}">${row.slice(0, maxCols).map((cell, ci) => {
-                let cellStyle = bodyStyle;
-                if (cf && data.numericCol?.[ci] && data.rawRows?.[ri]?.[ci] != null) {
+                const style = [bodyColor, alignOf(ci)].filter(Boolean).join(";");
+                let cellStyle = style;
+                if (cf && numericCol[ci] && data.rawRows?.[ri]?.[ci] != null) {
                   const raw = data.rawRows[ri][ci];
                   const dom = data.colDomains?.[ci];
                   const back = ts.backRule ? evaluateColorRule(ts.backRule, raw, dom) : "";
                   const font = ts.fontRule ? evaluateColorRule(ts.fontRule, raw, dom) : "";
-                  cellStyle = [back ? `background:${back}` : "", font ? `color:${font}` : bodyStyle].filter(Boolean).join(";");
+                  cellStyle = [back ? `background:${back}` : "", font ? `color:${font}` : bodyColor, alignOf(ci)].filter(Boolean).join(";");
                 }
                 return `<td style="${escapeAttribute(cellStyle)}">${escapeHtml(String(cell))}</td>`;
               }).join("")}</tr>`;
             }).join("")
           : Array.from({ length: 4 }, () => `<tr>${columns.slice(0, maxCols).map(() => "<td>—</td>").join("")}</tr>`).join("");
         const totalRow = data?.kind === "table" && ts.total?.show && data.hasNumeric
-          ? `<tr class="total-row" style="${[ts.total.color ? `color:${escapeAttribute(ts.total.color)}` : "", ts.total.back ? `background:${escapeAttribute(ts.total.back)}` : ""].filter(Boolean).join(";")}">${data.totals.slice(0, maxCols).map((t, i) => `<td>${i === 0 && !t ? "合計" : escapeHtml(String(t))}</td>`).join("")}</tr>`
+          ? `<tr class="total-row" style="${[ts.total.color ? `color:${escapeAttribute(ts.total.color)}` : "", ts.total.back ? `background:${escapeAttribute(ts.total.back)}` : ""].filter(Boolean).join(";")}">${data.totals.slice(0, maxCols).map((t, i) => `<td style="${alignOf(i)}">${i === 0 && !t ? "合計" : escapeHtml(String(t))}</td>`).join("")}</tr>`
           : "";
-        return `<table class="mini-grid"><thead><tr>${head}</tr></thead><tbody>${rows}${totalRow}</tbody></table>`;
+        const moreCols = data?.kind === "table" && data.colCount > maxCols ? data.colCount - maxCols : 0;
+        const footParts = [];
+        if (data?.moreRows) footParts.push(`他 ${data.moreRows} 行`);
+        if (moreCols) footParts.push(`他 ${moreCols} 列`);
+        const foot = footParts.length ? `<div class="mini-grid-more">${escapeHtml(footParts.join(" / "))}</div>` : "";
+        return `<div class="mini-grid-wrap"><table class="mini-grid"><thead><tr>${head}</tr></thead><tbody>${rows}${totalRow}</tbody></table>${foot}</div>`;
       }
     }
 
