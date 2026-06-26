@@ -851,7 +851,19 @@
       },
       card: extractCardStyle(objects),
       table: extractTableStyle(objects),
+      slicer: extractSlicerStyle(objects),
       dataColors: extractDataColors(objects),
+    };
+  }
+
+  function extractSlicerStyle(objects) {
+    const general = firstObjectProps(objects.general);
+    const header = firstObjectProps(objects.header);
+    const orientationRaw = readExprString(general?.orientation) || String(readExpr(general?.orientation) ?? "");
+    return {
+      orientation: /horizontal|^2$/i.test(orientationRaw) ? "horizontal" : "vertical",
+      headerShow: header ? readExprBool(header?.show) !== false : true,
+      headerText: readExprString(header?.text) || "",
     };
   }
 
@@ -2597,9 +2609,22 @@
         seriesList = [{ name: valueField.display, format: fmt, values: valuesArr }];
       }
 
-      const isLine = type.includes("line") || type.includes("area");
+      const isLine = (type.includes("line") || type.includes("area")) && !type.includes("combo");
+      const isCombo = type.includes("combo");
       const stacked = /stacked/i.test(type);
       const normalized = /hundredpercent|100/i.test(type);
+
+      // コンボ: 各系列を棒/線に分類(Line/Y2ロール → 線)
+      if (isCombo && !seriesColumn) {
+        seriesList.forEach((s, i) => {
+          const vf = valueFields[i];
+          const role = (visual.roles || []).find((r) => r.fields.includes(vf))?.role || "";
+          s.mode = /line|y2/i.test(role) ? "line" : "bar";
+        });
+        if (!seriesList.some((s) => s.mode === "line") && seriesList.length > 1) {
+          seriesList[seriesList.length - 1].mode = "line";
+        }
+      }
 
       // 並べ替え(棒/列は合計降順、折れ線は出現順)＋上限
       if (!isLine) {
@@ -2629,6 +2654,8 @@
       // 後方互換: 円/ツリーマップ/単一描画用に先頭系列のポイント配列も保持
       const points = categoriesList.map((label, i) => ({ label, value: seriesList[0].values[i], format }));
 
+      const combo = isCombo && seriesList.some((s) => s.mode === "line") && seriesList.some((s) => s.mode !== "line");
+
       return {
         kind: "category",
         categoryLabel: axisField.display,
@@ -2638,6 +2665,7 @@
         multi: seriesList.length > 1,
         stacked,
         normalized,
+        combo,
         format,
         max,
         series: points,
@@ -2920,11 +2948,20 @@
       return `<div class="mini-card">${body}</div>`;
     }
 
-    if (type.includes("line") || type.includes("area")) {
+    if (type.includes("combo") && data?.kind === "category") {
+      return wrapWithChartLegend(visual, data, theme, renderCombo(data, theme));
+    }
+
+    if ((type.includes("line") || type.includes("area")) && !type.includes("combo")) {
+      const isArea = type.includes("area");
       const seriesList = data?.kind === "category" ? data.seriesList : null;
       const paths = seriesList
-        ? seriesList.map((s, i) => `<path d="${escapeAttribute(linePath(s.values, data.max))}" fill="none" stroke="${escapeAttribute(theme[i % theme.length])}" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" />`).join("")
-        : `<path d="M5 52L28 35L48 42L74 18L96 27L116 10" fill="none" stroke="${escapeAttribute(color)}" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" />`;
+        ? seriesList.map((s, i) => {
+            const stroke = escapeAttribute(theme[i % theme.length]);
+            const fill = isArea ? `<path d="${escapeAttribute(areaPath(s.values, data.max))}" fill="${stroke}" fill-opacity="0.18" stroke="none" />` : "";
+            return `${fill}<path d="${escapeAttribute(linePath(s.values, data.max))}" fill="none" stroke="${stroke}" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" />`;
+          }).join("")
+        : `${isArea ? `<path d="M5 52L28 35L48 42L74 18L96 27L116 10L116 58L5 58Z" fill="${escapeAttribute(color)}" fill-opacity="0.18" stroke="none" />` : ""}<path d="M5 52L28 35L48 42L74 18L96 27L116 10" fill="none" stroke="${escapeAttribute(color)}" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" />`;
       const svg = `
         <svg class="mini-line" viewBox="0 0 120 64" preserveAspectRatio="none" aria-hidden="true">
           <path d="M5 58H116" stroke="#ded8ca" stroke-width="1" />
@@ -2976,13 +3013,15 @@
     }
 
     if (type.includes("slicer")) {
+      const sl = visual.style?.slicer || {};
       const items = data?.kind === "slicer" && data.items.length ? data.items : ["項目 1", "項目 2", "項目 3"];
-      return `
-        <div class="mini-slicer">
-          <span class="mini-slicer-head">${escapeHtml(categoryLabel || "Slicer")}</span>
-          ${items.slice(0, 6).map((item) => `<span><i></i>${escapeHtml(item)}</span>`).join("")}
-        </div>
-      `;
+      const horizontal = sl.orientation === "horizontal";
+      const head = sl.headerShow === false ? "" : `<span class="mini-slicer-head">${escapeHtml(sl.headerText || categoryLabel || "Slicer")}</span>`;
+      const limit = horizontal ? 8 : 6;
+      const cells = items.slice(0, limit).map((item) =>
+        horizontal ? `<span class="chip-item">${escapeHtml(item)}</span>` : `<span><i></i>${escapeHtml(item)}</span>`,
+      ).join("");
+      return `<div class="mini-slicer ${horizontal ? "horizontal" : ""}">${head}<div class="mini-slicer-items">${cells}</div></div>`;
     }
 
     // テーブル / マトリックス
@@ -3118,6 +3157,22 @@
     return `<div class="mbars ${horizontal ? "h" : "v"}">${groups}</div>`;
   }
 
+  // コンボ(列＋折れ線): 棒系列をバー描画し、線系列をSVGで重ね描き
+  function renderCombo(data, theme) {
+    const barSeries = data.seriesList.filter((s) => s.mode !== "line");
+    const lineSeries = data.seriesList.filter((s) => s.mode === "line");
+    const useBars = barSeries.length ? barSeries : data.seriesList;
+    const barMax = Math.max(1, ...useBars.flatMap((s) => s.values.map((v) => Math.abs(v))));
+    const barData = { ...data, seriesList: useBars, multi: useBars.length > 1, max: barMax };
+    const bars = useBars.length > 1 ? renderMultiBars(barData, theme, false, false) : renderDataBars({ ...barData, series: data.categories.map((label, i) => ({ label, value: useBars[0].values[i], format: data.format })) }, theme, false, false);
+    const lineMax = Math.max(1, ...lineSeries.flatMap((s) => s.values.map((v) => Math.abs(v))));
+    const lines = lineSeries
+      .map((s, i) => `<path d="${escapeAttribute(linePath(s.values, lineMax))}" fill="none" stroke="${escapeAttribute(theme[(barSeries.length + i) % theme.length])}" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" />`)
+      .join("");
+    const overlay = lineSeries.length ? `<svg class="combo-overlay" viewBox="0 0 120 64" preserveAspectRatio="none" aria-hidden="true">${lines}</svg>` : "";
+    return `<div class="combo-wrap">${bars}${overlay}</div>`;
+  }
+
   // チャート(棒/折れ線)に系列凡例を付与。legend.show と複数系列のときのみ
   function wrapWithChartLegend(visual, data, theme, chartHtml) {
     if (!data || data.kind !== "category" || !data.multi) return chartHtml;
@@ -3196,6 +3251,11 @@
         return `${index === 0 ? "M" : "L"}${x.toFixed(1)} ${y.toFixed(1)}`;
       })
       .join("");
+  }
+
+  function areaPath(values, max) {
+    if (!values.length) return "";
+    return `${linePath(values, max)}L116 58L5 58Z`;
   }
 
   function pieGradientFromData(series, theme) {

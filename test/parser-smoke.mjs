@@ -603,6 +603,40 @@ assert.equal(imgProject.report.pages[0].background.imageData, "data:image/svg+xm
 
 console.log("image smoke test passed");
 
+// --- チャート仕上げ: コンボ系列分類 / スライサー体裁 ---
+const polishTmdl = [
+  "table T",
+  "\tmeasure 売上 = SUM('T'[v1])",
+  "\tmeasure 率 = AVERAGE('T'[v2])",
+  "\tcolumn k", "\t\tdataType: string",
+  "\tcolumn v1", "\t\tdataType: int64",
+  "\tcolumn v2", "\t\tdataType: int64",
+  "\tpartition T = m", "\t\tsource =",
+  "\t\t\tlet Source = Table.FromRows({ {\"A\",10,5},{\"B\",20,8} }, type table [k=text, v1=Int64.Type, v2=Int64.Type]) in Source",
+].join("\n");
+const pm = (p) => ({ field: { Measure: { Expression: { SourceRef: { Entity: "T" } }, Property: p } }, queryRef: "T." + p, nativeQueryRef: p });
+const pc = (p) => ({ field: { Column: { Expression: { SourceRef: { Entity: "T" } }, Property: p } }, queryRef: "T." + p, nativeQueryRef: p });
+const pvis = (name, vtype, qs, objects) => ({ path: `PL.Report/definition/pages/P/visuals/${name}/visual.json`, text: JSON.stringify({ name, position: { x: 0, y: 0, width: 400, height: 240, z: 0 }, visual: { visualType: vtype, objects, query: { queryState: qs } } }), size: 200 });
+const polishProject = analyzeProject(
+  [
+    { path: "PL.pbip", text: JSON.stringify({ version: "1.0", artifacts: [{ report: { path: "PL.Report" } }] }), size: 40 },
+    { path: "PL.Report/definition/pages/pages.json", text: JSON.stringify({ pageOrder: ["P"] }), size: 30 },
+    { path: "PL.Report/definition/pages/P/page.json", text: JSON.stringify({ name: "P", displayName: "P", width: 1280, height: 720 }), size: 60 },
+    pvis("combo", "lineClusteredColumnComboChart", { Category: { projections: [pc("k")] }, Y: { projections: [pm("売上")] }, Y2: { projections: [pm("率")] } }),
+    pvis("sl", "slicer", { Category: { projections: [pc("k")] } }, { general: [{ properties: { orientation: { expr: { Literal: { Value: "'Horizontal'" } } } } }], header: [{ properties: { text: { expr: { Literal: { Value: "'選択'" } } } } }] }),
+    { path: "PL.SemanticModel/definition/tables/T.tmdl", text: polishTmdl, size: 300 },
+  ],
+  [],
+);
+const comboV = polishProject.report.pages[0].visuals.find((v) => v.id === "combo");
+assert.equal(comboV.data.combo, true, "combo detected");
+assert.deepEqual(comboV.data.seriesList.map((s) => s.mode), ["bar", "line"], "Y=bar, Y2=line");
+const slV = polishProject.report.pages[0].visuals.find((v) => v.id === "sl");
+assert.equal(slV.style.slicer.orientation, "horizontal", "slicer horizontal");
+assert.equal(slV.style.slicer.headerText, "選択", "slicer header text");
+
+console.log("chart polish smoke test passed");
+
 const legacyReportConfig = {
   name: "legacy_donut",
   layouts: [
