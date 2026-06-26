@@ -7,6 +7,9 @@ import path from "node:path";
 import { readEntries } from "../lib/read-entries.mjs";
 import { analyzeEntries, trimProject, summarize } from "../lib/analyze.mjs";
 import { buildSelfContainedHtml } from "../lib/build-html.mjs";
+import { evaluateExpression } from "../lib/model.mjs";
+import { diffProjects } from "../lib/diff.mjs";
+import { buildMarkdownReport } from "../lib/report.mjs";
 
 let pass = 0;
 function ok(cond, msg) {
@@ -172,6 +175,18 @@ async function main() {
   await fsp.writeFile(path.join(notPbip, "notes.txt"), "hello");
   const np = await readEntries(notPbip);
   ok(np.issues.some((i) => /PBIPらしき/.test(i.title)), "PBIPらしくないフォルダは警告を出す");
+
+  // 7) lib/model: evaluate DAX against the fixture's embedded data (売上: 100+200).
+  ok((await evaluateExpression(project, "SUM(売上[金額])")) === 300, "evaluateExpression: SUM(売上[金額]) = 300");
+  ok((await evaluateExpression(project, "[売上合計]")) === 300, "evaluateExpression: メジャー参照 [売上合計] = 300");
+  await assertRejects(() => evaluateExpression({ semantic: { tables: [] } }, "1+1"),
+    /埋め込みデータ/, "データ無しプロジェクトのDAX評価は明確に失敗する");
+
+  // 8) lib/diff: identical project -> no changes; report contains the measure.
+  const same = diffProjects(project, project);
+  ok(!same.measures.added.length && !same.measures.removed.length && !same.measures.changed.length, "同一プロジェクトの差分は空");
+  const md = buildMarkdownReport(project, "smoke");
+  ok(md.includes("# smoke — PBIP レポート") && md.includes("売上合計") && md.includes("```dax"), "Markdownレポートに見出し・メジャー・DAXが含まれる");
 
   await fsp.rm(base, { recursive: true, force: true });
   console.log(`cli-smoke: ${pass} checks passed`);

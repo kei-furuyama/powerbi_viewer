@@ -1886,6 +1886,18 @@
       const colBlock = readBalanced(text, colStart, "[", "]");
       if (colBlock) columns = parseTypeTable(colBlock);
     }
+    // 列名リスト形式 Table.FromRows(rows, {"列1","列2"}) にも対応(type table が無い場合)
+    if (!columns.length) {
+      const cm = text.slice(afterRows).match(/^\s*,\s*\{/);
+      if (cm) {
+        const braceIdx = text.indexOf("{", afterRows);
+        const listBlock = readBalanced(text, braceIdx, "{", "}");
+        if (listBlock) {
+          const names = [...listBlock.matchAll(/"((?:[^"]|"")*)"/g)].map((x) => x[1].replace(/""/g, '"'));
+          if (names.length) columns = names.map((n) => ({ name: n, type: "" }));
+        }
+      }
+    }
 
     const rows = parseRowList(rowsBlock);
     if (!rows.length) return null;

@@ -104,6 +104,16 @@ node bin/cli.mjs check ./MyReport && echo "Power BI で開けます"
 
 # Write a self-contained single-file HTML preview (offline; open in a browser)
 node bin/cli.mjs html ./MyReport -o preview.html
+
+# Evaluate a DAX expression against the embedded data
+node bin/cli.mjs dax ./MyReport "SUM(売上[金額])"
+node bin/cli.mjs dax ./MyReport "[件数]" --table 案件
+
+# Diff two PBIPs (pages / visuals / measures / columns / relationships / 検査)
+node bin/cli.mjs diff ./before ./after
+
+# Markdown report (overview, measure DAX, issues, relationships)
+node bin/cli.mjs report ./MyReport -o report.md
 ```
 
 `check` exits with code **1** when the project has integrity errors and **0**
@@ -144,6 +154,9 @@ Tools provided:
 | `analyze_pbip` | `{ path, includeRaw? }` | Structured analysis JSON (pages, visuals, measures, embedded data, validation) |
 | `validate_pbip` | `{ path }` | `{ ok, errors, warnings, problems, summary }` — whether it would open in Power BI |
 | `render_pbip_html` | `{ path, outPath? }` | Writes a self-contained HTML preview, returns its path |
+| `evaluate_dax` | `{ path, expression, table? }` | Evaluates a DAX expression against the embedded data (`SUM`, `CALCULATE`, `RELATED`, `TOTALYTD`, measure refs `[name]`…) |
+| `diff_pbip` | `{ pathA, pathB }` | Structural diff of pages/visuals/measures/columns/relationships/validation |
+| `report_pbip_markdown` | `{ path, outPath? }` | Markdown report (overview, measure DAX, issues, relationships) |
 
 ## Limitations
 

@@ -9,6 +9,9 @@ import { z } from "zod";
 import { readEntries, projectBaseName } from "../lib/read-entries.mjs";
 import { analyzeEntries, trimProject, summarize } from "../lib/analyze.mjs";
 import { buildSelfContainedHtml } from "../lib/build-html.mjs";
+import { evaluateExpression } from "../lib/model.mjs";
+import { diffProjects } from "../lib/diff.mjs";
+import { buildMarkdownReport } from "../lib/report.mjs";
 
 async function loadProject(inputPath) {
   const { entries, issues } = await readEntries(inputPath);
@@ -98,6 +101,69 @@ server.registerTool(
     const html = await buildSelfContainedHtml(entries, { title: `${name} — PBIP Viewer` });
     await fsp.writeFile(out, html);
     return asText({ outPath: out, bytes: html.length });
+  }),
+);
+
+server.registerTool(
+  "evaluate_dax",
+  {
+    title: "DAX式を評価",
+    description:
+      "PBIPの埋め込みデータ(Table.FromRows)に対してDAX式を評価し結果を返す。" +
+      "メジャー参照 [名前] や SUM/CALCULATE/RELATED/TOTALYTD 等に対応。" +
+      "table を省略するとメジャーを持つ最初のテーブルが文脈になる。",
+    inputSchema: {
+      path: z.string().describe("PBIP プロジェクトフォルダ、または .zip ファイルへのパス"),
+      expression: z.string().describe('評価するDAX式。例: "SUM(売上[金額])" や "[件数]"'),
+      table: z.string().optional().describe("行/フィルタ文脈とするテーブル名（省略可）"),
+    },
+  },
+  safe(async ({ path: inputPath, expression, table }) => {
+    const { project } = await loadProject(inputPath);
+    const result = await evaluateExpression(project, expression, table);
+    return asText({ expression, table: table || null, result });
+  }),
+);
+
+server.registerTool(
+  "diff_pbip",
+  {
+    title: "2つのPBIPを差分比較",
+    description:
+      "2つのPBIPのページ/ビジュアル/メジャー(DAX)/列/リレーション/検査の追加・削除・変更を構造化して返す。" +
+      "Claudeで再生成した前後の比較に有用。",
+    inputSchema: {
+      pathA: z.string().describe("比較元PBIP（フォルダ or .zip）"),
+      pathB: z.string().describe("比較先PBIP（フォルダ or .zip）"),
+    },
+  },
+  safe(async ({ pathA, pathB }) => {
+    const { project: a } = await loadProject(pathA);
+    const { project: b } = await loadProject(pathB);
+    return asText(diffProjects(a, b));
+  }),
+);
+
+server.registerTool(
+  "report_pbip_markdown",
+  {
+    title: "PBIPのMarkdownレポート",
+    description:
+      "PBIPの概要・ページ別ビジュアル・メジャーのDAX・検出事項・リレーションをMarkdownで返す（outPath指定で書き出し）。",
+    inputSchema: {
+      path: z.string().describe("PBIP プロジェクトフォルダ、または .zip ファイルへのパス"),
+      outPath: z.string().optional().describe("出力先 .md パス（省略時は本文を返す）"),
+    },
+  },
+  safe(async ({ path: inputPath, outPath }) => {
+    const { project } = await loadProject(inputPath);
+    const md = buildMarkdownReport(project, projectBaseName(inputPath));
+    if (outPath) {
+      const out = path.resolve(outPath);
+      await fsp.writeFile(out, md);
+      return asText({ outPath: out, bytes: md.length });
+    }
+    return asText(md);
   }),
 );
 
