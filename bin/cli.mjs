@@ -109,9 +109,10 @@ async function main() {
     if (flags.json) {
       process.stdout.write(JSON.stringify({ errors: v.errors, warnings: v.warnings, problems: v.problems }, null, 2) + "\n");
     } else {
-      const problems = (project.issues || []).filter((i) => i.level === "error" || i.level === "warning");
+      // 一覧と合計を同じ source (validation.problems) から出すことで件数のズレを防ぐ
+      const problems = v.problems || [];
       if (!problems.length) process.stdout.write("検査OK: 問題は見つかりませんでした。\n");
-      for (const p of problems) process.stdout.write(`[${p.level.toUpperCase()}] ${p.title}: ${p.detail || ""}\n`);
+      for (const p of problems) process.stdout.write(`[${String(p.level).toUpperCase()}] ${p.title}: ${p.detail || ""}\n`);
       process.stdout.write(`\n結果: エラー ${v.errors} / 警告 ${v.warnings}\n`);
     }
     if (v.errors > 0) process.exitCode = 1;

@@ -16,6 +16,7 @@
     "app.js",
     "index.html",
     "styles.css",
+    "jszip.min.js",
     "bin",
     "lib"
   ],

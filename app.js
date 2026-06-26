@@ -87,7 +87,18 @@
     });
 
     els.dropZone.addEventListener("drop", (event) => {
-      handleFiles(event.dataTransfer.files);
+      // webkitGetAsEntry はドロップイベント中に同期で取得する必要がある
+      const dt = event.dataTransfer;
+      const items = dt.items ? [...dt.items] : [];
+      const roots = items
+        .map((it) => (typeof it.webkitGetAsEntry === "function" ? it.webkitGetAsEntry() : null))
+        .filter(Boolean);
+      const fallback = [...dt.files];
+      if (!roots.length || !roots.some((entry) => entry.isDirectory)) {
+        handleFiles(fallback);
+        return;
+      }
+      collectDroppedEntries(roots).then((collected) => handleFiles(collected.length ? collected : fallback));
     });
 
     // キャンバス幅が変わったらフォントスケールを再計算するため再描画
@@ -100,9 +111,39 @@
     });
   }
 
+  // ドロップされたディレクトリエントリを再帰的に走査して {file, relPath} を集める
+  function collectDroppedEntries(roots) {
+    const out = [];
+    const walkEntry = (entry) => new Promise((resolve) => {
+      if (entry.isFile) {
+        entry.file(
+          (file) => { out.push({ file, relPath: entry.fullPath.replace(/^\/+/, "") }); resolve(); },
+          () => resolve(),
+        );
+      } else if (entry.isDirectory) {
+        const reader = entry.createReader();
+        const readBatch = () => reader.readEntries(
+          async (batch) => {
+            if (!batch.length) { resolve(); return; }
+            await Promise.all(batch.map(walkEntry));
+            readBatch(); // readEntries はチャンク返却なので空になるまで繰り返す
+          },
+          () => resolve(),
+        );
+        readBatch();
+      } else {
+        resolve();
+      }
+    });
+    return Promise.all(roots.map(walkEntry)).then(() => out);
+  }
+
   async function handleFiles(fileList) {
     const files = [...fileList];
-    if (!files.length) return;
+    if (!files.length) {
+      setStatus("読み込めるファイルがありませんでした（フォルダは「フォルダを開く」推奨、または .zip をドロップ）");
+      return;
+    }
 
     setStatus(`${files.length}件の入力を読み込み中...`);
 
@@ -141,8 +182,9 @@
     const entries = [];
     const issues = [];
 
-    for (const file of files) {
-      const path = normalizePath(file.webkitRelativePath || file.name);
+    for (const raw of files) {
+      const file = raw instanceof File ? raw : raw.file;
+      const path = normalizePath((raw && raw.relPath) || file.webkitRelativePath || file.name);
       const lower = path.toLowerCase();
 
       if (lower.endsWith(".pbix")) {
@@ -281,11 +323,7 @@
       } catch (error) {
         const detail = error instanceof Error ? error.message : String(error);
         entry.jsonError = detail;
-        issues.push({
-          level: "error",
-          title: "JSONを解析できません",
-          detail: `${entry.path}: ${detail}`,
-        });
+        // 検査(validateProject)が entry.jsonError から一度だけ報告するので、ここでは二重計上しない
       }
     }
 
@@ -294,7 +332,14 @@
     const dataModel = buildDataModel(semantic);
     hydrateVisualData(report, dataModel);
     resolveImages(report, normalizedEntries, issues);
-    const measureUsage = computeModelAnalysis(report, semantic);
+    let measureUsage;
+    try {
+      measureUsage = computeModelAnalysis(report, semantic);
+    } catch (error) {
+      // モデル静的解析が想定外データで失敗しても、全体の解析は止めない
+      measureUsage = { unused: 0, unusedColumns: 0, cycles: [], lint: [] };
+      issues.push({ level: "warning", title: "モデル静的解析を完了できませんでした", detail: String(error?.message || error) });
+    }
     const validation = validateProject(normalizedEntries, report, semantic, jsonByPath);
 
     // 循環参照はPower BIで開けない致命的エラーなので、整合性検査に統合する(検査の終了コードに反映)
@@ -442,6 +487,7 @@
     report.pagesJson = firstJsonEnding(jsonByPath, "/definition/pages/pages.json");
     report.meta = extractReportMeta(report.definitionPbir, report.reportJson);
     report.theme = extractTheme(entries, jsonByPath, report.reportJson);
+    activePalette = report.theme?.dataColors?.length ? report.theme.dataColors : DEFAULT_THEME_COLORS;
 
     const pageEntries = entries.filter((entry) => {
       const lower = entry.path.toLowerCase();
@@ -536,6 +582,22 @@
     "#118DFF", "#12239E", "#E66C37", "#6B007B", "#E044A7",
     "#744EC2", "#D9B300", "#D64550", "#197278", "#1AAB40",
   ];
+
+  // 解析中のレポートのテーマパレット(ThemeDataColor の ColorId 解決に使う)
+  let activePalette = DEFAULT_THEME_COLORS;
+
+  // hexをpercent(-1..1)で明(正)/暗(負)方向にシェード
+  function shadeHex(hex, percent) {
+    const m = /^#?([0-9a-f]{6})$/i.exec(String(hex || "").trim());
+    if (!m) return normalizeColor(hex);
+    const p = Math.max(-1, Math.min(1, Number(percent) || 0));
+    const ch = (i) => {
+      const c = parseInt(m[1].slice(i, i + 2), 16);
+      const v = p >= 0 ? Math.round(c + (255 - c) * p) : Math.round(c * (1 + p));
+      return Math.max(0, Math.min(255, v)).toString(16).padStart(2, "0");
+    };
+    return `#${ch(0)}${ch(2)}${ch(4)}`;
+  }
 
   function extractTheme(entries, jsonByPath, reportJson) {
     const palettes = [];
@@ -810,7 +872,15 @@
 
     let table = "";
     let name = "";
-    if (inner) {
+    if (field.HierarchyLevel) {
+      // 階層レベルはレベル名(Level)が実フィールド名。テーブルは入れ子のSourceRefから。
+      const hl = field.HierarchyLevel;
+      const hierExpr = hl.Expression?.Hierarchy || hl.Hierarchy;
+      const src = hierExpr?.Expression || hierExpr;
+      const rawTable = src?.SourceRef?.Entity || src?.SourceRef?.Source;
+      table = cleanFieldName(aliasMap.get(String(rawTable)) || rawTable || "");
+      name = cleanFieldName(hl.Level || "");
+    } else if (inner) {
       const resolved = fieldFromExpression(inner, aliasMap);
       table = cleanFieldName(resolved.table || "");
       name = cleanFieldName(resolved.name || "");
@@ -1125,6 +1195,21 @@
       const colorValue = readExpr(solid.color || solid.Color);
       if (typeof colorValue === "string" && colorValue) return normalizeColor(colorValue);
     }
+    // テーマパレット参照: { ThemeDataColor: { ColorId, Percent } } を解決
+    let themeColor = "";
+    walk(prop, (node) => {
+      if (themeColor || !node || typeof node !== "object") return;
+      const tc = node.ThemeDataColor || node.ThemeColor;
+      if (!tc) return;
+      const id = Number(readExpr(tc.ColorId) ?? tc.ColorId);
+      if (!Number.isFinite(id) || !activePalette.length) return;
+      let pct = Number(readExpr(tc.Percent) ?? tc.Percent ?? 0);
+      if (!Number.isFinite(pct)) pct = 0;
+      if (Math.abs(pct) > 1) pct = pct / 100; // %スケール(例:20)を正規化
+      const base = activePalette[((id % activePalette.length) + activePalette.length) % activePalette.length];
+      themeColor = shadeHex(base, pct);
+    });
+    if (themeColor) return themeColor;
     let found = "";
     walk(prop, (node) => {
       if (found) return;
@@ -1439,6 +1524,13 @@
         const field = fieldFromExpression(node.Hierarchy, aliasMap);
         add("hierarchy", field.table, field.name, String(key || ""));
       }
+      if (node.HierarchyLevel && typeof node.HierarchyLevel === "object") {
+        const hl = node.HierarchyLevel;
+        const hierExpr = hl.Expression?.Hierarchy || hl.Hierarchy;
+        const src = hierExpr?.Expression || hierExpr;
+        const rawTable = src?.SourceRef?.Entity || src?.SourceRef?.Source;
+        add("hierarchy", aliasMap.get(String(rawTable)) || rawTable, hl.Level, String(key || ""));
+      }
     });
 
     const textRefs = [];
@@ -1547,8 +1639,22 @@
 
     for (const entry of entries.filter((item) => item.path.toLowerCase().endsWith(".tmdl"))) {
       const parsed = parseTmdl(entry.text, inferTableNameFromPath(entry.path), entry.path);
-      const inline = extractInlineData(entry.text);
-      if (inline && parsed.tables[0]) parsed.tables[0].data = inline;
+      // インラインデータ(Table.FromRows)は、各 table 宣言ごとのテキスト範囲から抽出して
+      // その table に割り当てる(複数テーブル .tmdl で先頭テーブルへ誤割当しない)。
+      const declOffsets = [];
+      const declRe = /^[\t ]*table\s+/gim;
+      let dm;
+      while ((dm = declRe.exec(entry.text))) declOffsets.push(dm.index);
+      if (declOffsets.length === parsed.tables.length && declOffsets.length > 0) {
+        parsed.tables.forEach((table, i) => {
+          const slice = entry.text.slice(declOffsets[i], declOffsets[i + 1] ?? entry.text.length);
+          const inline = extractInlineData(slice);
+          if (inline) table.data = inline;
+        });
+      } else {
+        const inline = extractInlineData(entry.text);
+        if (inline && parsed.tables[0]) parsed.tables[0].data = inline;
+      }
       if (parsed.tables.length) {
         parsed.tables.forEach(addTable);
       }
@@ -1626,9 +1732,23 @@
       return currentTable;
     }
 
-    for (const rawLine of text.split(/\r?\n/)) {
+    const indentOf = (s) => (s.match(/^[\t ]*/)[0] || "").length;
+    // TMDLのプロパティ宣言(複数行メジャー本文の終端目印にも使う)
+    const KNOWN_PROP = /^(formatString|displayFolder|description|isHidden|lineageTag|sourceLineageTag|dataType|dataCategory|sortByColumn|summarizeBy|annotation|changedProperty|formatStringDefinition|relatedColumnDetails|kpi|isNameInferred|isDataTypeInferred|sourceColumn|mode|source)\b/i;
+    const DECL = /^(table|column|measure|hierarchy|partition|relationship)\s/i;
+
+    const dedentBlock = (lines) => {
+      const nonblank = lines.filter((l) => l.trim());
+      const min = nonblank.length ? Math.min(...nonblank.map(indentOf)) : 0;
+      return lines.map((l) => l.slice(min)).join("\n").replace(/\s+$/, "");
+    };
+
+    const rawLines = text.split(/\r?\n/);
+    for (let li = 0; li < rawLines.length; li += 1) {
+      const rawLine = rawLines[li];
       const line = rawLine.trim();
       if (!line || line.startsWith("//")) continue;
+      const indent = indentOf(rawLine);
 
       const tableName = readTmdlDeclaration(line, "table");
       if (tableName) {
@@ -1648,35 +1768,55 @@
 
       const columnName = readTmdlDeclaration(line, "column");
       if (columnName) {
-        currentItem = { type: "column", item: { name: columnName, dataType: "", formatString: "" } };
+        currentItem = { type: "column", indent, item: { name: columnName, dataType: "", formatString: "" } };
         ensureTable().columns.push(currentItem.item);
         continue;
       }
 
       const measureName = readTmdlDeclaration(line, "measure");
       if (measureName) {
-        currentItem = {
-          type: "measure",
-          item: {
-            name: measureName,
-            expression: readAfterEquals(line),
-            formatString: "",
-          },
-        };
-        ensureTable().measures.push(currentItem.item);
+        const item = { name: measureName, expression: "", formatString: "" };
+        const afterEq = readAfterEquals(line);
+        if (afterEq.startsWith("```")) {
+          // バッククォート囲みブロック: 閉じ ``` まで取り込む
+          const body = [];
+          for (li += 1; li < rawLines.length; li += 1) {
+            if (rawLines[li].trim() === "```") break;
+            body.push(rawLines[li]);
+          }
+          item.expression = dedentBlock(body).trim();
+        } else if (afterEq) {
+          item.expression = afterEq;
+        } else {
+          // 宣言行に式が無い場合、宣言よりも深いインデントの行を本文として収集
+          const body = [];
+          let lj = li + 1;
+          for (; lj < rawLines.length; lj += 1) {
+            const rl = rawLines[lj];
+            const t = rl.trim();
+            if (!t) { body.push(rl); continue; }
+            if (indentOf(rl) <= indent || KNOWN_PROP.test(t) || DECL.test(t)) break;
+            body.push(rl);
+          }
+          while (body.length && !body[body.length - 1].trim()) body.pop();
+          item.expression = dedentBlock(body).trim().replace(/^=\s*/, "");
+          li = lj - 1;
+        }
+        currentItem = { type: "measure", indent, item };
+        ensureTable().measures.push(item);
         continue;
       }
 
       const hierarchyName = readTmdlDeclaration(line, "hierarchy");
       if (hierarchyName) {
-        currentItem = { type: "hierarchy", item: { name: hierarchyName } };
+        currentItem = { type: "hierarchy", indent, item: { name: hierarchyName } };
         ensureTable().hierarchies.push(currentItem.item);
         continue;
       }
 
       const partitionName = readTmdlDeclaration(line, "partition");
       if (partitionName) {
-        currentItem = { type: "partition", item: { name: partitionName } };
+        currentItem = { type: "partition", indent, item: { name: partitionName } };
         ensureTable().partitions.push(currentItem.item);
         continue;
       }
@@ -1685,11 +1825,14 @@
       if (relationshipName) {
         const relationship = { name: relationshipName, path };
         result.relationships.push(relationship);
-        currentItem = { type: "relationship", item: relationship };
+        currentItem = { type: "relationship", indent, item: relationship };
         continue;
       }
 
-      if (currentItem?.type === "relationship") {
+      // プロパティはカレント項目より深いインデントのときだけ束縛(スコープ外への漏れ防止)
+      const childOfCurrent = currentItem && indent > currentItem.indent;
+
+      if (currentItem?.type === "relationship" && childOfCurrent) {
         const relMatch = line.match(/^(fromColumn|toColumn|fromCardinality|toCardinality|crossFilteringBehavior|isActive)\s*:\s*(.+)$/i);
         if (relMatch) {
           const key = relMatch[1];
@@ -1704,20 +1847,16 @@
         }
       }
 
-      if (currentItem && /^dataType\s*:/i.test(line)) {
+      if (childOfCurrent && /^dataType\s*:/i.test(line)) {
         currentItem.item.dataType = line.split(":").slice(1).join(":").trim();
       }
 
-      if (currentItem && /^formatString\s*:/i.test(line)) {
+      if (childOfCurrent && /^formatString\s*:/i.test(line)) {
         currentItem.item.formatString = cleanLiteral(line.split(":").slice(1).join(":").trim());
       }
 
-      if (currentItem?.type === "column" && /^sortByColumn\s*:/i.test(line)) {
+      if (currentItem?.type === "column" && childOfCurrent && /^sortByColumn\s*:/i.test(line)) {
         currentItem.item.sortByColumn = cleanLiteral(line.split(":").slice(1).join(":").trim());
-      }
-
-      if (currentItem?.type === "measure" && !currentItem.item.expression && /^\s*=/.test(rawLine)) {
-        currentItem.item.expression = rawLine.replace(/^\s*=\s*/, "").trim();
       }
     }
 
@@ -1956,8 +2095,9 @@
   const DAX_PRECEDENCE = {
     "||": 1, "&&": 2,
     "=": 3, "<>": 3, "<": 3, ">": 3, "<=": 3, ">=": 3,
-    "&": 4, "+": 4, "-": 4,
-    "*": 5, "/": 5,
+    "&": 4,
+    "+": 5, "-": 5,
+    "*": 6, "/": 6,
   };
 
   function parseDax(tokens) {
@@ -2284,9 +2424,27 @@
       return truthy(evalDaxNode(args[0], ctx)) ? evalDaxNode(args[1], ctx) : (args[2] ? evalDaxNode(args[2], ctx) : null);
     }
 
+    if (name === "SWITCH") {
+      const test = evalDaxNode(args[0], ctx);
+      const isTrueSwitch = test === true; // SWITCH(TRUE(), cond, result, ...)
+      let i = 1;
+      for (; i + 1 < args.length; i += 2) {
+        const matched = isTrueSwitch
+          ? truthy(evalDaxNode(args[i], ctx))
+          : compareValues(test, evalDaxNode(args[i], ctx)) === 0;
+        if (matched) return evalDaxNode(args[i + 1], ctx);
+      }
+      return i < args.length ? evalDaxNode(args[i], ctx) : null; // trailing default
+    }
+
+    if (name === "AND") return args.every((a) => truthy(evalDaxNode(a, ctx)));
+    if (name === "OR") return args.some((a) => truthy(evalDaxNode(a, ctx)));
+    if (name === "NOT") return !truthy(evalDaxNode(args[0], ctx));
+
     if (name === "IFERROR") {
-      const value = evalDaxNode(args[0], ctx);
-      return value == null ? evalDaxNode(args[1], ctx) : value;
+      // This evaluator never throws DAX errors (DIVIDE-by-zero etc. return BLANK),
+      // so IFERROR faithfully returns its first argument (BLANK is not an error).
+      return evalDaxNode(args[0], ctx);
     }
 
     if (name === "COALESCE") {
@@ -2324,8 +2482,9 @@
     if (value == null) return "—";
     // 文字列を返すメジャー(FORMAT連結など)はそのまま表示
     if (typeof value === "string" && !/^-?[\d,]+(\.\d+)?$/.test(value.trim())) return value;
-    if (!Number.isFinite(Number(value))) return "—";
-    const number = Number(value);
+    // 桁区切りカンマ付きの数値文字列("1,234")も数値として扱う
+    const number = typeof value === "number" ? value : Number(String(value).replace(/,/g, ""));
+    if (!Number.isFinite(number)) return "—";
     if (!formatString) return groupThousands(roundTo(number, 2));
 
     const literals = [...formatString.matchAll(/"([^"]*)"/g)].map((match) => match[1]).join("");
@@ -2362,12 +2521,22 @@
 
   function resolveImages(report, entries, issues) {
     const index = new Map();
+    const collisions = new Set();
     for (const entry of entries) {
       if (!entry.isImage || !entry.dataUrl) continue;
       const base = basename(entry.path).toLowerCase();
+      // 別フォルダの同名画像は basename 解決でどちらか一方に化けるため、衝突を可視化する
+      if (index.has(base) && index.get(base) !== entry.dataUrl) collisions.add(base);
       index.set(base, entry.dataUrl);
       index.set(normalizeName(base), entry.dataUrl);
       index.set(entry.path.toLowerCase(), entry.dataUrl);
+    }
+    if (collisions.size) {
+      issues.push({
+        level: "warning",
+        title: `同名の画像ファイルが複数あります (${collisions.size}件)`,
+        detail: `${[...collisions].slice(0, 8).join(" / ")} — フォルダが違っても同じファイル名だと、ビジュアルに別の画像が表示されることがあります。`,
+      });
     }
 
     const resolve = (name) => {
@@ -2442,10 +2611,18 @@
     const dupPages = pageIds.filter((id, index) => pageIds.indexOf(id) !== index);
     for (const id of new Set(dupPages)) add("error", "ページ名が重複しています", id);
 
+    // page.json は存在するが壊れて解析できなかったページのディレクトリ名(pageOrderの誤検出抑止用)
+    const brokenPageDirs = new Set();
+    for (const entry of entries) {
+      const m = entry.path.match(/\/pages\/([^/]+)\/page\.json$/i);
+      if (m && entry.jsonError) brokenPageDirs.add(m[1]);
+    }
+
     const order = Array.isArray(report.pagesJson?.pageOrder) ? report.pagesJson.pageOrder.map(String) : [];
     if (order.length) {
       for (const id of order) {
-        if (!pageIds.includes(id)) add("error", "pageOrderが実在しないページを参照", `pages.json の pageOrder に "${id}" がありますが、対応する page.json がありません。`);
+        // 壊れた page.json は「JSONが壊れています」で既に報告済みなので、実在しない扱いにはしない
+        if (!pageIds.includes(id) && !brokenPageDirs.has(id)) add("error", "pageOrderが実在しないページを参照", `pages.json の pageOrder に "${id}" がありますが、対応する page.json がありません。`);
       }
       for (const id of pageIds) {
         if (!order.includes(id)) add("warning", "pageOrderに無いページ", `"${id}" は pages.json の pageOrder に含まれていません。`);
@@ -2476,8 +2653,23 @@
           name: table.name,
           cols: new Set(table.columns.map((column) => normalizeName(column.name))),
           meas: new Set(table.measures.map((measure) => normalizeName(measure.name))),
+          hiers: new Set((table.hierarchies || []).map((h) => normalizeName(h.name))),
         });
       }
+
+      // メジャー名のモデル内重複(Power BIはメジャー名のグローバル一意を要求)
+      const measureNameMap = new Map();
+      for (const table of semantic.tables) {
+        for (const measure of table.measures) {
+          const nn = normalizeName(measure.name);
+          if (!measureNameMap.has(nn)) measureNameMap.set(nn, []);
+          measureNameMap.get(nn).push(`${table.name}[${measure.name}]`);
+        }
+      }
+      for (const [, list] of measureNameMap) {
+        if (list.length > 1) add("error", "メジャー名がモデル内で重複しています", list.join(" / "));
+      }
+
       const checked = new Set();
       for (const visual of report.visuals) {
         for (const role of visual.roles || []) {
@@ -2492,9 +2684,21 @@
               continue;
             }
             const nn = normalizeName(field.name);
-            const exists = field.kind === "measure" ? table.meas.has(nn) : table.cols.has(nn) || table.meas.has(nn);
+            let exists;
+            if (field.kind === "measure") {
+              exists = table.meas.has(nn);
+            } else if (field.kind === "hierarchy") {
+              // 階層名そのもの / "階層.レベル" 形式 / レベル列名 のいずれかが在ればOK
+              const head = normalizeName(String(field.name).split(".")[0]);
+              const tail = normalizeName(String(field.name).split(".").pop());
+              exists = table.hiers.has(nn) || table.hiers.has(head) || table.cols.has(tail) || table.cols.has(nn);
+            } else {
+              exists = table.cols.has(nn) || table.meas.has(nn);
+            }
             if (!exists) {
-              add("error", "存在しない列/メジャーを参照", `${visual.title || visual.id}: ${field.table}[${field.name}] がモデルにありません。`);
+              // 階層参照は解決しきれないことがあるため、致命的エラーにはしない(検査の終了コードを誤って1にしない)
+              const level = field.kind === "hierarchy" ? "warning" : "error";
+              add(level, "存在しない列/メジャーを参照", `${visual.title || visual.id}: ${field.table}[${field.name}] がモデルにありません。`);
             }
           }
         }
@@ -2509,7 +2713,7 @@
       }
       for (const table of semantic.tables) {
         for (const measure of table.measures) {
-          const refs = String(measure.expression || "").match(/\[([^\]]+)\]/g) || [];
+          const refs = String(stripDaxNoise(measure.expression) || "").match(/\[([^\]]+)\]/g) || [];
           for (const ref of refs) {
             const nn = normalizeName(ref.slice(1, -1));
             if (nn === normalizeName(measure.name)) continue;
@@ -2569,7 +2773,7 @@
     const clean = stripDaxNoise(expr);
     const qualified = [];
     let masked = clean;
-    const qre = /(?:'([^']+)'|([A-Za-z_][\w]*))\[([^\]]+)\]/g;
+    const qre = /(?:'([^']+)'|([\p{L}_][\p{L}\p{N}_]*))\[([^\]]+)\]/gu;
     let m;
     while ((m = qre.exec(clean))) {
       qualified.push({ table: m[1] || m[2], name: m[3] });
@@ -2582,12 +2786,17 @@
   }
 
   // メジャー依存グラフ・推移的未使用・循環参照・未使用列・DAX lint をまとめて算出
+  // 識別子キー: 大文字小文字のみ畳み込み、内側の空白/アンダースコアは保持(別名の衝突回避)
+  function identityName(value) {
+    return String(value || "").trim().replace(/^[\['"]+/, "").replace(/[\]'"]+$/, "").toLowerCase();
+  }
+
   function computeModelAnalysis(report, semantic) {
     const tables = semantic.tables || [];
     const measuresList = [];
-    const measureByNorm = new Map();
-    const columnByKey = new Map();
-    const columnByNorm = new Map();
+    const measureByNorm = new Map();      // normalizeName -> [ {table, measure} ] (緩い一致・全候補)
+    const columnByKey = new Map();        // identity table|col -> {table, column}
+    const columnByNorm = new Map();       // normalizeName(col) -> [ {table, column} ]
 
     for (const table of tables) {
       for (const measure of table.measures) {
@@ -2597,33 +2806,43 @@
         measure.inCycle = false;
         measure.lint = [];
         const key = normalizeName(measure.name);
-        if (!measureByNorm.has(key)) measureByNorm.set(key, { table, measure });
+        if (!measureByNorm.has(key)) measureByNorm.set(key, []);
+        measureByNorm.get(key).push({ table, measure });
         measuresList.push({ table, measure });
       }
       for (const column of table.columns) {
         column.used = false;
-        columnByKey.set(`${normalizeName(table.name)}|${normalizeName(column.name)}`, { table, column });
+        columnByKey.set(`${identityName(table.name)}|${identityName(column.name)}`, { table, column });
         const nkey = normalizeName(column.name);
         if (!columnByNorm.has(nkey)) columnByNorm.set(nkey, []);
         columnByNorm.get(nkey).push({ table, column });
       }
     }
 
-    const measureId = (t, mm) => `${normalizeName(t.name)}|${normalizeName(mm.name)}`;
+    const measureId = (t, mm) => `${identityName(t.name)}|${identityName(mm.name)}`;
     const measureLabel = (entry) => `${entry.table.name}[${entry.measure.name}]`;
     const byId = new Map(measuresList.map((e) => [measureId(e.table, e.measure), e]));
-    const findMeasure = (name) => measureByNorm.get(normalizeName(name)) || null;
+    // テーブル優先のメジャー解決(同名メジャーが複数テーブルにある場合は参照元と同じテーブルを優先)
+    const findMeasure = (name, preferTable) => {
+      const list = measureByNorm.get(normalizeName(name));
+      if (!list || !list.length) return null;
+      if (preferTable) {
+        const same = list.find((e) => identityName(e.table.name) === identityName(preferTable));
+        if (same) return same;
+      }
+      return list[0];
+    };
     const findColumn = (tableName, colName) => {
       if (tableName) {
-        const hit = columnByKey.get(`${normalizeName(tableName)}|${normalizeName(colName)}`);
+        const hit = columnByKey.get(`${identityName(tableName)}|${identityName(colName)}`);
         if (hit) return hit;
       }
       const list = columnByNorm.get(normalizeName(colName));
       return list && list.length ? list[0] : null;
     };
-    const colKey = (entry) => `${normalizeName(entry.table.name)}|${normalizeName(entry.column.name)}`;
+    const colKey = (entry) => `${identityName(entry.table.name)}|${identityName(entry.column.name)}`;
 
-    // メジャーの依存(他メジャー)と参照列を収集
+    // メジャーの依存(他メジャー)と参照列を収集。自己参照も依存として記録(循環検出のため)。
     const graph = new Map();              // measureId -> Set(measureId)
     const measureColumnRefs = new Map();  // measureId -> Set(columnKey)
     for (const entry of measuresList) {
@@ -2632,24 +2851,24 @@
       const refs = extractDaxRefs(measure.expression);
       const deps = new Set();
       const cols = new Set();
-      const selfNorm = normalizeName(measure.name);
       for (const q of refs.qualified) {
         const col = findColumn(q.table, q.name);
         if (col) { cols.add(colKey(col)); continue; }
-        const mm = findMeasure(q.name);
+        const mm = findMeasure(q.name, table.name);
         if (mm) {
-          if (measureId(mm.table, mm.measure) !== id) deps.add(measureId(mm.table, mm.measure));
+          deps.add(measureId(mm.table, mm.measure));
           measure.lint.push({ rule: "qualified-measure", message: `メジャー参照 ${q.table}[${q.name}] はテーブル修飾子なし [${q.name}] が推奨です（メジャーはテーブルに属しません）。` });
         }
       }
       for (const name of refs.bare) {
-        const mm = findMeasure(name);
-        if (mm && normalizeName(name) !== selfNorm) { deps.add(measureId(mm.table, mm.measure)); continue; }
-        if (mm && normalizeName(name) === selfNorm) continue;
+        const mm = findMeasure(name, table.name);
+        if (mm) { deps.add(measureId(mm.table, mm.measure)); continue; }
         const col = findColumn(table.name, name) || findColumn(null, name);
         if (col) cols.add(colKey(col));
       }
-      if (/\//.test(stripDaxNoise(measure.expression))) {
+      // 除算lint: ブラケット内の識別子や引用テーブル名に含まれる '/' を除外してから判定
+      const forDivision = stripDaxNoise(measure.expression).replace(/\[[^\]]*\]/g, "[]").replace(/'(?:[^']|'')*'/g, "''");
+      if (/\//.test(forDivision)) {
         measure.lint.push({ rule: "division", message: "除算に `/` を使用しています。0除算・空対策に DIVIDE() の利用を検討してください。" });
       }
       graph.set(id, deps);
@@ -2702,32 +2921,10 @@
       if (!entry.measure.used) unused += 1;
     }
 
-    // 循環参照(メジャー依存グラフのDFSサイクル検出)
-    const color = new Map();              // 0=未訪問,1=訪問中,2=完了
-    const pathStack = [];
-    const cycleSet = new Map();           // 正規化キー -> ラベル配列
+    // 循環参照: 反復版Tarjan SCC(深い依存連鎖でもスタックを溢れさせない)。
+    // SCCのノードが2以上、または単一ノードに自己辺があれば循環とみなす。
     const labelOf = (id) => (byId.get(id) ? measureLabel(byId.get(id)) : id);
-    const dfs = (id) => {
-      color.set(id, 1);
-      pathStack.push(id);
-      for (const dep of graph.get(id) || []) {
-        if (!byId.has(dep)) continue;
-        const c = color.get(dep) || 0;
-        if (c === 1) {
-          const start = pathStack.indexOf(dep);
-          const ring = pathStack.slice(start);
-          const key = [...ring].sort().join(">");
-          if (!cycleSet.has(key)) cycleSet.set(key, ring.map(labelOf));
-          for (const cid of ring) { const e = byId.get(cid); if (e) e.measure.inCycle = true; }
-        } else if (c === 0) {
-          dfs(dep);
-        }
-      }
-      pathStack.pop();
-      color.set(id, 2);
-    };
-    for (const id of byId.keys()) if ((color.get(id) || 0) === 0) dfs(id);
-    const cycles = [...cycleSet.values()];
+    const cycles = findMeasureCycles(graph, byId, labelOf);
 
     // 列の使用判定: ビジュアル + 使用中メジャーのDAX + リレーションシップ
     for (const entry of measuresList) {
@@ -2735,8 +2932,8 @@
       for (const ck of measureColumnRefs.get(measureId(entry.table, entry.measure)) || []) usedColumns.add(ck);
     }
     for (const rel of semantic.relationships || []) {
-      if (rel.fromTable && rel.fromColumn) usedColumns.add(`${normalizeName(rel.fromTable)}|${normalizeName(rel.fromColumn)}`);
-      if (rel.toTable && rel.toColumn) usedColumns.add(`${normalizeName(rel.toTable)}|${normalizeName(rel.toColumn)}`);
+      const f = findColumn(rel.fromTable, rel.fromColumn); if (f) usedColumns.add(colKey(f));
+      const t = findColumn(rel.toTable, rel.toColumn); if (t) usedColumns.add(colKey(t));
     }
     // 並べ替えキー(sortByColumn)として参照される列も使用中とみなす
     for (const table of tables) {
@@ -2749,13 +2946,58 @@
     let unusedColumns = 0;
     for (const table of tables) {
       for (const column of table.columns) {
-        column.used = usedColumns.has(`${normalizeName(table.name)}|${normalizeName(column.name)}`);
+        column.used = usedColumns.has(`${identityName(table.name)}|${identityName(column.name)}`);
         if (!column.used) unusedColumns += 1;
       }
     }
 
     const lint = measuresList.flatMap((e) => e.measure.lint.map((l) => ({ measure: measureLabel(e), ...l })));
     return { unused, unusedColumns, cycles, lint };
+  }
+
+  // 反復版Tarjan SCCで循環参照を検出。各メジャーに inCycle を立て、循環ごとにラベル配列を返す。
+  function findMeasureCycles(graph, byId, labelOf) {
+    let index = 0;
+    const idx = new Map();
+    const low = new Map();
+    const onStack = new Set();
+    const S = [];
+    const cycles = [];
+    for (const start of byId.keys()) {
+      if (idx.has(start)) continue;
+      const work = [{ v: start, edges: [...(graph.get(start) || [])].filter((d) => byId.has(d)), i: 0 }];
+      idx.set(start, index); low.set(start, index); index += 1; S.push(start); onStack.add(start);
+      while (work.length) {
+        const frame = work[work.length - 1];
+        if (frame.i < frame.edges.length) {
+          const w = frame.edges[frame.i]; frame.i += 1;
+          if (!idx.has(w)) {
+            idx.set(w, index); low.set(w, index); index += 1; S.push(w); onStack.add(w);
+            work.push({ v: w, edges: [...(graph.get(w) || [])].filter((d) => byId.has(d)), i: 0 });
+          } else if (onStack.has(w)) {
+            low.set(frame.v, Math.min(low.get(frame.v), idx.get(w)));
+          }
+        } else {
+          const v = frame.v;
+          if (low.get(v) === idx.get(v)) {
+            const comp = [];
+            let w;
+            do { w = S.pop(); onStack.delete(w); comp.push(w); } while (w !== v);
+            const hasSelfEdge = (graph.get(v) || new Set()).has(v);
+            if (comp.length > 1 || (comp.length === 1 && hasSelfEdge)) {
+              cycles.push(comp.map(labelOf));
+              for (const cid of comp) { const e = byId.get(cid); if (e) e.measure.inCycle = true; }
+            }
+          }
+          work.pop();
+          if (work.length) {
+            const parent = work[work.length - 1].v;
+            low.set(parent, Math.min(low.get(parent), low.get(v)));
+          }
+        }
+      }
+    }
+    return cycles;
   }
 
   function roleFieldsByKind(visual, kind) {
@@ -3200,8 +3442,8 @@
     }
 
     els.canvasMeta.textContent = `${Math.round(page.width)} x ${Math.round(page.height)} / ${page.visuals.length} visuals`;
-    els.reportCanvas.style.aspectRatio = `${page.width} / ${page.height}`;
-    els.reportCanvas.style.background = page.background?.color || "";
+    els.reportCanvas.style.aspectRatio = `${page.width || DEFAULT_PAGE.width} / ${page.height || DEFAULT_PAGE.height}`;
+    els.reportCanvas.style.background = page.background?.color ? colorWithAlpha(page.background.color, page.background.transparency) : "";
     els.reportCanvas.style.color = state.project?.report?.theme?.foreground || "";
     // ページ背景画像/壁紙
     if (page.background?.imageData) {
@@ -3217,7 +3459,7 @@
     const theme = getTheme();
     // キャンバスの実描画幅から論理座標→ピクセルのスケールを算出(ズーム追従・全ブラウザ対応)
     const canvasWidthPx = els.reportCanvas.clientWidth || 1120;
-    const fontScale = canvasWidthPx / page.width;
+    const fontScale = canvasWidthPx / (page.width || DEFAULT_PAGE.width);
 
     for (const visual of page.visuals) {
       const style = visual.style || {};
@@ -3322,11 +3564,14 @@
     }
 
     if (type.includes("image")) {
-      if (visual.imageData) {
+      const src = visual.imageData || "";
+      const isRemote = /^https?:\/\//i.test(src);
+      if (src && !isRemote) {
         const fit = visual.imageRef?.scaling || "contain";
-        return `<img class="mini-image-img" src="${escapeAttribute(visual.imageData)}" alt="${escapeHtml(visual.title || "image")}" style="object-fit:${escapeAttribute(fit)}" />`;
+        return `<img class="mini-image-img" src="${escapeAttribute(src)}" alt="${escapeHtml(visual.title || "image")}" style="object-fit:${escapeAttribute(fit)}" />`;
       }
-      return `<div class="mini-image" aria-hidden="true"></div>`;
+      // 外部URL画像は「非通信」ポリシー(CSP)で読み込まないため、プレースホルダを表示
+      return `<div class="mini-image" aria-hidden="true">${isRemote ? `<span class="mini-image-note">外部画像（非表示）</span>` : ""}</div>`;
     }
 
     if (type.includes("shape")) {
@@ -3409,7 +3654,7 @@
       const showLegend = legendConf.show !== false && data?.kind === "category";
       const position = legendConf.position || "right";
       const legend = showLegend ? pieLegend(data.series, sliceColors || theme, data.format) : "";
-      const pieHtml = `<div class="mini-pie" style="background:conic-gradient(${stops})" aria-hidden="true">${inner}</div>`;
+      const pieHtml = `<div class="mini-pie" style="background:conic-gradient(${escapeAttribute(stops)})" aria-hidden="true">${inner}</div>`;
       return `<div class="mini-pie-wrap legend-${escapeAttribute(showLegend ? position : "none")}">${pieHtml}${legend}</div>`;
     }
 
@@ -3534,7 +3779,7 @@
               return `<span style="${styles}">${escapeHtml(run.text)}</span>`;
             })
             .join("");
-          return `<div class="mini-text-line" style="${paragraph.align ? `text-align:${paragraph.align}` : ""}">${runs}</div>`;
+          return `<div class="mini-text-line" style="${paragraph.align ? `text-align:${escapeAttribute(paragraph.align)}` : ""}">${runs}</div>`;
         })
         .join("");
       return `<div class="mini-text rich">${html}</div>`;
@@ -3755,7 +4000,8 @@
     const angle = Math.PI - ratio * Math.PI; // 左(180°)→右(0°)
     const ex = (cx + r * Math.cos(angle)).toFixed(2);
     const ey = (cy - r * Math.sin(angle)).toFixed(2);
-    const largeArc = ratio > 0.5 ? 1 : 0;
+    // 値の弧は最大でも半円(ratio*180°≤180°)なので large-arc-flag は常に0
+    const largeArc = 0;
     const valuePath = ratio <= 0 ? "" : `<path d="M6 50 A${r} ${r} 0 ${largeArc} 1 ${ex} ${ey}" fill="none" stroke="${escapeAttribute(color)}" stroke-width="10" stroke-linecap="round" />`;
     return `
       <div class="mini-gauge">
@@ -3815,7 +4061,9 @@
   }
 
   function pieGradientFromData(series, theme) {
-    const total = series.reduce((sum, point) => sum + Math.max(0, point.value), 0) || 1;
+    const total = series.reduce((sum, point) => sum + Math.max(0, point.value), 0);
+    // 全て0/負の値のときは任意の色で塗りつぶさず、ニュートラルな空表示にする
+    if (total <= 0) return "var(--line, #e6e1d6) 0% 100%";
     let acc = 0;
     return series
       .map((point, index) => {

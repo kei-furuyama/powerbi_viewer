@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 
 await import("../app.js");
 
-const { analyzeProject } = globalThis.PBIPViewerParser;
+const { analyzeProject, parseTmdl } = globalThis.PBIPViewerParser;
 
 const entries = [
   {
@@ -1003,3 +1003,50 @@ assert.equal(colsByName["未使用列"].used, false, "未使用列 is unused");
 assert.ok(mUsage.unusedColumns >= 1, "unused columns counted");
 
 console.log("model static analysis smoke test passed");
+
+// --- whole-codebase review regression fixes ---
+// #10 & precedence, #3 SWITCH, #4 AND/OR/NOT, #22 IFERROR
+assert.equal(evaluateDax('"R" & 1 + 2', { rows: [{}], row: {} }), "R3", "& binds below +");
+assert.equal(evaluateDax('SWITCH(2, 1, "a", 2, "b", "d")', { rows: [{}], row: {} }), "b", "SWITCH value match");
+assert.equal(evaluateDax('SWITCH(TRUE(), 1>2, "x", 1<2, "y")', { rows: [{}], row: {} }), "y", "SWITCH(TRUE())");
+assert.equal(evaluateDax('AND(TRUE(), FALSE())', { rows: [{}], row: {} }), false, "AND()");
+assert.equal(evaluateDax('OR(FALSE(), TRUE())', { rows: [{}], row: {} }), true, "OR()");
+assert.equal(evaluateDax('NOT(FALSE())', { rows: [{}], row: {} }), true, "NOT()");
+
+// #1 multi-line measure (bare continuation + backtick block) + #21 property scope
+const mlTmdl = [
+  "table T",
+  "\tmeasure Total =",
+  "\t\t\tCALCULATE(",
+  "\t\t\t\tSUM(T[Amt])",
+  "\t\t\t)",
+  "\t\tformatString: #,##0",
+  "\tmeasure Fenced = ```",
+  "\t\t\tSUMX(T, T[Amt])",
+  "\t\t\t```",
+  "\tcolumn Amt",
+  "\t\tdataType: int64",
+].join("\n");
+const mlParsed = parseTmdl(mlTmdl, "T", "T.tmdl");
+const mlM = Object.fromEntries(mlParsed.tables[0].measures.map((m) => [m.name, m]));
+assert.ok(/CALCULATE/.test(mlM["Total"].expression) && /SUM\(T\[Amt\]\)/.test(mlM["Total"].expression), "multi-line bare measure captured");
+assert.equal(mlM["Total"].formatString, "#,##0", "formatString not swallowed by measure body (#21)");
+assert.ok(/SUMX/.test(mlM["Fenced"].expression) && !mlM["Fenced"].expression.includes("```"), "backtick measure captured, fences stripped");
+
+// #5 Japanese qualified ref + #6 self-ref cycle + #8 hierarchy not a hard error
+const jpVisual = {
+  name: "v", position: { x: 0, y: 0, width: 100, height: 80, z: 0 },
+  visual: { visualType: "card", query: { queryState: { Values: { projections: [{ field: { Measure: { Property: "合計" } }, queryRef: "合計" }] } } } },
+};
+const jpProject = analyzeProject([
+  { path: "J.Report/definition/pages/p/visuals/v/visual.json", text: JSON.stringify(jpVisual), size: 200 },
+  { path: "J.Report/definition/pages/p/page.json", text: JSON.stringify({ name: "p", displayName: "P", width: 1280, height: 720 }), size: 80 },
+  { path: "J.Report/definition/pages/p/pages.json", text: JSON.stringify({ pageOrder: ["p"], activePageName: "p" }), size: 60 },
+  { path: "J.SemanticModel/definition/tables/売上.tmdl", text: ["table 売上", "\tcolumn 金額", "\t\tdataType: int64", "\tcolumn 未使用", "\t\tdataType: int64", "\tmeasure 合計 = SUM(売上[金額])", "\tmeasure 自己 = [自己] + 1"].join("\n"), size: 300 },
+], []);
+const jpCols = Object.fromEntries(jpProject.semantic.tables[0].columns.map((c) => [c.name, c]));
+assert.equal(jpCols["金額"].used, true, "Japanese qualified ref 売上[金額] marks 金額 used (#5)");
+assert.equal(jpCols["未使用"].used, false, "未使用 column detected");
+assert.ok(jpProject.measureUsage.cycles.some((ring) => ring.join().includes("自己")), "self-reference cycle detected (#6)");
+
+console.log("review regression smoke test passed");
