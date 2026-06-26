@@ -818,6 +818,7 @@
     const bgProps = firstObjectProps(containerObjects.background) || firstObjectProps(objects.background);
     const borderProps = firstObjectProps(containerObjects.border) || firstObjectProps(objects.border);
     const fillProps = firstObjectProps(objects.fill);
+    const shadowProps = firstObjectProps(containerObjects.dropShadow) || firstObjectProps(objects.dropShadow);
 
     const legendProps = firstObjectProps(objects.legend);
     const labelsProps = firstObjectProps(objects.labels) || firstObjectProps(objects.dataLabels) || firstObjectProps(objects.detailLabels);
@@ -841,14 +842,22 @@
       },
       background: {
         color: readExprColor(bgProps?.color),
-        show: readExprBool(bgProps?.show) !== false,
+        explicit: Boolean(bgProps),
+        show: bgProps ? readExprBool(bgProps?.show) !== false : null,
         transparency: readExprNumber(bgProps?.transparency),
       },
       border: {
         color: readExprColor(borderProps?.color),
         show: readExprBool(borderProps?.show) === true,
+        width: readExprNumber(borderProps?.weight) ?? readExprNumber(borderProps?.width),
         radius: readExprNumber(borderProps?.radius),
       },
+      shadow: shadowProps
+        ? {
+            show: readExprBool(shadowProps.show) !== false,
+            color: readExprColor(shadowProps.color) || "rgba(0,0,0,0.28)",
+          }
+        : null,
       legend: {
         // legendオブジェクトが存在し show:false の時だけ非表示、未指定は既定ON
         show: legendProps ? readExprBool(legendProps.show) !== false : true,
@@ -1095,6 +1104,15 @@
   function normalizeColor(value) {
     const text = cleanLiteral(String(value || "")).trim();
     return /^#[0-9a-f]{3,8}$/i.test(text) ? text : "";
+  }
+
+  // Power BIの透明度(0-100)を反映したrgba。0/未指定は元の色のまま
+  function colorWithAlpha(hex, transparency) {
+    if (!Number.isFinite(transparency) || transparency <= 0) return hex;
+    const rgb = hexToRgb(hex);
+    if (!rgb) return hex;
+    const alpha = Math.max(0, Math.min(1, 1 - transparency / 100));
+    return `rgba(${rgb[0]}, ${rgb[1]}, ${rgb[2]}, ${alpha.toFixed(3)})`;
   }
 
   function extractRichText(visualObject, visualRoot) {
@@ -3019,14 +3037,28 @@
       box.style.height = `${percent(visual.position.height, page.height)}%`;
       box.style.zIndex = String(Math.max(1, Math.round(visual.position.z || 0) + 1));
 
-      const boxBackground =
-        style.background?.color || (visual.type.toLowerCase().includes("shape") ? style.fill : "");
-      if (boxBackground) box.style.background = boxBackground;
-      if (style.border?.show && style.border.color) box.style.borderColor = style.border.color;
+      // 背景: show=false は透明、show=true は色(透明度反映)。図形は塗りを背景に
+      const bg = style.background || {};
+      if (bg.explicit && bg.show === false) {
+        box.style.background = "transparent";
+      } else if (bg.color) {
+        box.style.background = colorWithAlpha(bg.color, bg.transparency);
+      } else if (lowerType.includes("shape") && style.fill) {
+        box.style.background = style.fill;
+      }
+      // 枠線(visualContainerObjects.border): 色＋太さ
+      if (style.border?.show && style.border.color) {
+        const bw = Number.isFinite(style.border.width) ? Math.max(1, Math.round(style.border.width)) : 1;
+        box.style.border = `${bw}px solid ${style.border.color}`;
+      }
       if (Number.isFinite(style.border?.radius)) box.style.borderRadius = `${style.border.radius}px`;
       // 図形の枠線(line/outline)を反映
       if (lowerType.includes("shape") && style.line?.show && style.line.color) {
         box.style.border = `${Math.max(1, Math.round(style.line.weight || 1))}px solid ${style.line.color}`;
+      }
+      // ドロップシャドウ
+      if (style.shadow?.show) {
+        box.style.boxShadow = `0 2px 6px ${style.shadow.color}`;
       }
 
 

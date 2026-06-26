@@ -810,6 +810,30 @@ assert.deepEqual(wf.series.map((p) => p.value), [100, 40, -30], "waterfall value
 
 console.log("waterfall smoke test passed");
 
+// --- ビジュアル背景/枠線/影の設定 ---
+const solid = (hex) => ({ solid: { color: { expr: { Literal: { Value: `'${hex}'` } } } } });
+const lit = (v) => ({ expr: { Literal: { Value: String(v) } } });
+const bgCard = (name, vco) => ({ path: `BG.Report/definition/pages/P/visuals/${name}/visual.json`, text: JSON.stringify({ name, position: { x: 0, y: 0, width: 200, height: 120, z: 0 }, visual: { visualType: "cardVisual", visualContainerObjects: vco, query: { queryState: { Data: { projections: [ct2M("X")] } } } } }), size: 200 });
+const bgProject = analyzeProject(
+  [
+    { path: "BG.pbip", text: JSON.stringify({ version: "1.0", artifacts: [{ report: { path: "BG.Report" } }] }), size: 40 },
+    { path: "BG.Report/definition/pages/pages.json", text: JSON.stringify({ pageOrder: ["P"] }), size: 30 },
+    { path: "BG.Report/definition/pages/P/page.json", text: JSON.stringify({ name: "P", displayName: "P", width: 1280, height: 720 }), size: 60 },
+    bgCard("off", { background: [{ properties: { show: lit("false") } }] }),
+    bgCard("semi", { background: [{ properties: { color: solid("#1F5FA6"), transparency: lit("60D") } }], border: [{ properties: { show: lit("true"), color: solid("#1F5FA6"), weight: lit("3D") } }], dropShadow: [{ properties: { show: lit("true") } }] }),
+    { path: "BG.SemanticModel/definition/tables/T.tmdl", text: ct2Tmdl, size: 300 },
+  ],
+  [],
+);
+const offV = bgProject.report.pages[0].visuals.find((v) => v.id === "off");
+assert.equal(offV.style.background.show, false, "background show:false detected");
+const semiV = bgProject.report.pages[0].visuals.find((v) => v.id === "semi");
+assert.equal(semiV.style.background.transparency, 60, "background transparency parsed");
+assert.equal(semiV.style.border.width, 3, "border weight parsed");
+assert.equal(semiV.style.shadow.show, true, "drop shadow detected");
+
+console.log("visual background smoke test passed");
+
 const legacyReportConfig = {
   name: "legacy_donut",
   layouts: [
