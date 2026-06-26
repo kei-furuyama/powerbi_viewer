@@ -853,6 +853,7 @@
       table: extractTableStyle(objects),
       slicer: extractSlicerStyle(objects),
       dataColors: extractDataColors(objects),
+      dataPointRule: extractDataPointRule(objects),
     };
   }
 
@@ -878,6 +879,8 @@
       fontColor: readExprColor(vals?.fontColorPrimary) || readExprColor(vals?.fontColor),
       bandPrimary: readExprColor(vals?.backColorPrimary),
       bandSecondary: readExprColor(vals?.backColorSecondary),
+      backRule: parseColorRule(vals?.backColor) || parseColorRule(vals?.backColorRule),
+      fontRule: parseColorRule(vals?.fontColor) || parseColorRule(vals?.fontColorRule),
       total: {
         show: tot ? readExprBool(tot?.show) === true : false,
         color: readExprColor(tot?.fontColor),
@@ -929,6 +932,100 @@
     return colors;
   }
 
+  // 条件付き書式(データ点 fill のグラデ/ルール)
+  function extractDataPointRule(objects) {
+    const props = firstObjectProps(objects?.dataPoint);
+    return parseColorRule(props?.fill) || parseColorRule(props?.defaultColor);
+  }
+
+  // fillRule(グラデ)/backColorRule(ルール) を共通記述子に解析
+  function parseColorRule(prop) {
+    if (!prop || typeof prop !== "object") return null;
+    let grad = null;
+    let cases = null;
+    walk(prop, (node) => {
+      if (grad || cases) return;
+      if (!node || typeof node !== "object") return;
+      if (node.linearGradient2 || node.linearGradient3) grad = node.linearGradient2 || node.linearGradient3;
+      else if (Array.isArray(node.cases)) cases = node.cases;
+    });
+
+    if (grad) {
+      const stop = (s) => {
+        if (!s) return null;
+        const color = ruleColorValue(s.color);
+        if (!color) return null;
+        return { color, value: readExprNumber(s.value) };
+      };
+      const stops = [stop(grad.min), stop(grad.mid), stop(grad.max)].filter(Boolean);
+      if (stops.length >= 2) return { kind: "gradient", stops };
+    }
+    if (cases) {
+      const parsed = cases
+        .map((entry) => {
+          const cmp = entry.Compare || entry.condition?.Compare || entry.compare;
+          const color = ruleColorValue(entry.value ?? entry.color);
+          if (!color) return null;
+          const op = COMPARISON_OPS[cmp?.ComparisonKind] != null ? COMPARISON_OPS[cmp.ComparisonKind] : "=";
+          const value = parseDaxLiteral(cmp?.Right?.Literal?.Value ?? cmp?.right);
+          return { op, value, color };
+        })
+        .filter(Boolean);
+      if (parsed.length) return { kind: "rule", cases: parsed };
+    }
+    return null;
+  }
+
+  function ruleColorValue(node) {
+    if (node == null) return "";
+    const direct = normalizeColor(readExpr(node));
+    if (direct) return direct;
+    return readExprColor(node);
+  }
+
+  // 値→色（グラデは線形補間、ルールは条件一致）
+  function evaluateColorRule(rule, value, domain) {
+    if (!rule || value == null || !Number.isFinite(Number(value))) return "";
+    const num = Number(value);
+    if (rule.kind === "rule") {
+      for (const c of rule.cases) {
+        const cmp = compareValues(num, c.value);
+        const hit = c.op === ">" ? cmp > 0 : c.op === "<" ? cmp < 0 : c.op === ">=" ? cmp >= 0 : c.op === "<=" ? cmp <= 0 : c.op === "<>" ? cmp !== 0 : cmp === 0;
+        if (hit) return c.color;
+      }
+      return "";
+    }
+    // gradient: ストップ値が無ければデータ域を使用
+    const stops = rule.stops.map((s, i) => ({ color: s.color, value: Number.isFinite(s.value) ? s.value : null }));
+    const lo = Number.isFinite(stops[0].value) ? stops[0].value : domain?.min ?? 0;
+    const hi = Number.isFinite(stops[stops.length - 1].value) ? stops[stops.length - 1].value : domain?.max ?? 1;
+    if (hi === lo) return stops[stops.length - 1].color;
+    const t = Math.max(0, Math.min(1, (num - lo) / (hi - lo)));
+    if (stops.length >= 3) {
+      return t < 0.5 ? interpolateColor(stops[0].color, stops[1].color, t / 0.5) : interpolateColor(stops[1].color, stops[2].color, (t - 0.5) / 0.5);
+    }
+    return interpolateColor(stops[0].color, stops[stops.length - 1].color, t);
+  }
+
+  function interpolateColor(a, b, t) {
+    const ca = hexToRgb(a);
+    const cb = hexToRgb(b);
+    if (!ca || !cb) return a || b || "";
+    const mix = (x, y) => Math.round(x + (y - x) * t);
+    return rgbToHex(mix(ca[0], cb[0]), mix(ca[1], cb[1]), mix(ca[2], cb[2]));
+  }
+
+  function hexToRgb(hex) {
+    let h = String(hex || "").replace("#", "");
+    if (h.length === 3) h = h.split("").map((c) => c + c).join("");
+    if (h.length < 6) return null;
+    return [parseInt(h.slice(0, 2), 16), parseInt(h.slice(2, 4), 16), parseInt(h.slice(4, 6), 16)];
+  }
+
+  function rgbToHex(r, g, b) {
+    return `#${[r, g, b].map((v) => Math.max(0, Math.min(255, v)).toString(16).padStart(2, "0")).join("")}`;
+  }
+
   function firstObjectProps(value) {
     if (Array.isArray(value)) return value[0]?.properties || value[0] || null;
     if (value && typeof value === "object") return value.properties || value;
@@ -960,7 +1057,8 @@
 
   function readExprNumber(prop) {
     const value = readExpr(prop);
-    const number = Number(String(value ?? "").replace(/['D]/g, ""));
+    if (value == null || value === "") return undefined;
+    const number = Number(String(value).replace(/['D]/g, ""));
     return Number.isFinite(number) ? number : undefined;
   }
 
@@ -2524,11 +2622,15 @@
     if (type.includes("table") || type.includes("pivot") || type.includes("matrix")) {
       const plain = [...categories, ...values].filter((field) => field.kind !== "measure");
       const columnNames = plain.map((field) => resolveColumn(table, field.name) || field.name);
-      const rows = records.slice(0, 8).map((record) => columnNames.map((name) => formatCell(record[name])));
+      const shown = records.slice(0, 8);
+      const rows = shown.map((record) => columnNames.map((name) => formatCell(record[name])));
+      // 条件付き書式用に生の数値も保持
+      const rawRows = shown.map((record) => columnNames.map((name) => (record[name] != null && record[name] !== "" && Number.isFinite(Number(record[name])) ? Number(record[name]) : null)));
       // 数値列は合計を算出(合計行表示用)
       const numericCol = columnNames.map((name) => records.some((r) => r[name] != null && r[name] !== "") && records.every((r) => r[name] == null || r[name] === "" || Number.isFinite(Number(r[name]))));
+      const colDomains = columnNames.map((name, i) => (numericCol[i] ? seriesDomain(records.map((r) => r[name])) : null));
       const totals = columnNames.map((name, i) => (numericCol[i] ? groupThousands(roundTo(records.reduce((s, r) => s + (Number(r[name]) || 0), 0), 2)) : ""));
-      return { kind: "table", columns: plain.map((field) => field.display), rows, totals, hasNumeric: numericCol.some(Boolean), total: records.length };
+      return { kind: "table", columns: plain.map((field) => field.display), rows, rawRows, numericCol, colDomains, totals, hasNumeric: numericCol.some(Boolean), total: records.length };
     }
 
     // スライサー
@@ -2973,12 +3075,14 @@
     }
 
     if (type.includes("pie") || type.includes("donut")) {
-      const stops = data?.kind === "category" ? pieGradientFromData(data.series, theme) : pieGradient(theme);
+      const rule = visual.style?.dataPointRule;
+      const sliceColors = data?.kind === "category" ? sliceColorList(data.series, theme, rule) : null;
+      const stops = data?.kind === "category" ? pieGradientFromData(data.series, sliceColors) : pieGradient(theme);
       const inner = type.includes("donut") ? `<span class="mini-pie-hole"></span>` : "";
       const legendConf = visual.style?.legend || {};
       const showLegend = legendConf.show !== false && data?.kind === "category";
       const position = legendConf.position || "right";
-      const legend = showLegend ? pieLegend(data.series, theme, data.format) : "";
+      const legend = showLegend ? pieLegend(data.series, sliceColors || theme, data.format) : "";
       const pieHtml = `<div class="mini-pie" style="background:conic-gradient(${stops})" aria-hidden="true">${inner}</div>`;
       return `<div class="mini-pie-wrap legend-${escapeAttribute(showLegend ? position : "none")}">${pieHtml}${legend}</div>`;
     }
@@ -2989,7 +3093,7 @@
         const showLabels = visual.style?.dataLabels?.show !== false;
         const chart = data.multi
           ? renderMultiBars(data, theme, horizontal, showLabels)
-          : renderDataBars(data, theme, horizontal, showLabels);
+          : renderDataBars(data, theme, horizontal, showLabels, visual.style?.dataPointRule);
         return wrapWithChartLegend(visual, data, theme, chart);
       }
       const heights = [42, 70, 54, 86, 62];
@@ -3038,10 +3142,21 @@
         const bodyStyle = ts.fontColor ? `color:${escapeAttribute(ts.fontColor)}` : "";
         const head = columns.slice(0, maxCols).map((name) => `<th style="${headStyle}">${escapeHtml(name)}</th>`).join("");
         const banded = ts.bandPrimary || ts.bandSecondary;
+        const cf = ts.backRule || ts.fontRule; // 条件付き書式
         const rows = data?.kind === "table" && data.rows.length
           ? data.rows.slice(0, 6).map((row, ri) => {
               const band = banded ? `background:${escapeAttribute((ri % 2 ? ts.bandSecondary : ts.bandPrimary) || "")}` : "";
-              return `<tr style="${band}">${row.slice(0, maxCols).map((cell) => `<td style="${bodyStyle}">${escapeHtml(String(cell))}</td>`).join("")}</tr>`;
+              return `<tr style="${band}">${row.slice(0, maxCols).map((cell, ci) => {
+                let cellStyle = bodyStyle;
+                if (cf && data.numericCol?.[ci] && data.rawRows?.[ri]?.[ci] != null) {
+                  const raw = data.rawRows[ri][ci];
+                  const dom = data.colDomains?.[ci];
+                  const back = ts.backRule ? evaluateColorRule(ts.backRule, raw, dom) : "";
+                  const font = ts.fontRule ? evaluateColorRule(ts.fontRule, raw, dom) : "";
+                  cellStyle = [back ? `background:${back}` : "", font ? `color:${font}` : bodyStyle].filter(Boolean).join(";");
+                }
+                return `<td style="${escapeAttribute(cellStyle)}">${escapeHtml(String(cell))}</td>`;
+              }).join("")}</tr>`;
             }).join("")
           : Array.from({ length: 4 }, () => `<tr>${columns.slice(0, maxCols).map(() => "<td>—</td>").join("")}</tr>`).join("");
         const totalRow = data?.kind === "table" && ts.total?.show && data.hasNumeric
@@ -3102,12 +3217,13 @@
       .join(", ");
   }
 
-  function renderDataBars(data, theme, horizontal, showLabels = true) {
+  function renderDataBars(data, theme, horizontal, showLabels = true, rule = null) {
+    const domain = rule ? seriesDomain(data.series.map((p) => p.value)) : null;
     const bars = data.series
       .map((point, index) => {
         const ratio = Math.max(0, Math.abs(point.value) / data.max);
         const size = `${(ratio * 100).toFixed(1)}%`;
-        const color = escapeAttribute(theme[index % theme.length]);
+        const color = escapeAttribute((rule && evaluateColorRule(rule, point.value, domain)) || theme[index % theme.length]);
         const valueText = formatMeasureValue(point.value, data.format);
         if (horizontal) {
           return `
@@ -3256,6 +3372,17 @@
   function areaPath(values, max) {
     if (!values.length) return "";
     return `${linePath(values, max)}L116 58L5 58Z`;
+  }
+
+  function seriesDomain(values) {
+    const nums = values.map(Number).filter((v) => Number.isFinite(v));
+    if (!nums.length) return { min: 0, max: 1 };
+    return { min: Math.min(...nums), max: Math.max(...nums) };
+  }
+
+  function sliceColorList(series, theme, rule) {
+    const domain = rule ? seriesDomain(series.map((p) => p.value)) : null;
+    return series.map((point, index) => (rule && evaluateColorRule(rule, point.value, domain)) || theme[index % theme.length]);
   }
 
   function pieGradientFromData(series, theme) {

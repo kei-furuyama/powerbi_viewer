@@ -637,6 +637,26 @@ assert.equal(slV.style.slicer.headerText, "選択", "slicer header text");
 
 console.log("chart polish smoke test passed");
 
+// --- 条件付き書式: グラデの抽出 ---
+const grad = { solid: { color: { expr: { FillRule: { Input: { Measure: { Property: "売上" } }, FillRule: { linearGradient3: { min: { color: { Literal: { Value: "'#E0584E'" } } }, mid: { color: { Literal: { Value: "'#F2C94C'" } } }, max: { color: { Literal: { Value: "'#27AE60'" } } } } } } } } } };
+const cfProject = analyzeProject(
+  [
+    { path: "CF.pbip", text: JSON.stringify({ version: "1.0", artifacts: [{ report: { path: "CF.Report" } }] }), size: 40 },
+    { path: "CF.Report/definition/pages/pages.json", text: JSON.stringify({ pageOrder: ["P"] }), size: 30 },
+    { path: "CF.Report/definition/pages/P/page.json", text: JSON.stringify({ name: "P", displayName: "P", width: 1280, height: 720 }), size: 60 },
+    { path: "CF.Report/definition/pages/P/visuals/bar/visual.json", text: JSON.stringify({ name: "bar", position: { x: 0, y: 0, width: 400, height: 240, z: 0 }, visual: { visualType: "clusteredColumnChart", objects: { dataPoint: [{ properties: { fill: grad } }] }, query: { queryState: { Category: { projections: [{ field: { Column: { Expression: { SourceRef: { Entity: "T" } }, Property: "k" } }, queryRef: "T.k", nativeQueryRef: "k" }] }, Y: { projections: [{ field: { Measure: { Expression: { SourceRef: { Entity: "T" } }, Property: "売上" } }, queryRef: "T.売上", nativeQueryRef: "売上" }] } } } } }), size: 200 },
+    { path: "CF.SemanticModel/definition/tables/T.tmdl", text: ["table T", "\tmeasure 売上 = SUM('T'[v])", "\tcolumn k", "\t\tdataType: string", "\tcolumn v", "\t\tdataType: int64", "\tpartition T = m", "\t\tsource =", "\t\t\tlet Source = Table.FromRows({ {\"A\",10},{\"B\",90} }, type table [k=text, v=Int64.Type]) in Source"].join("\n"), size: 200 },
+  ],
+  [],
+);
+const cfBar = cfProject.report.pages[0].visuals.find((v) => v.id === "bar");
+assert.equal(cfBar.style.dataPointRule.kind, "gradient", "data point conditional gradient parsed");
+assert.equal(cfBar.style.dataPointRule.stops.length, 3, "3-stop gradient");
+assert.equal(cfBar.style.dataPointRule.stops[0].color, "#E0584E", "gradient min color");
+assert.equal(cfBar.style.dataPointRule.stops[0].value, undefined, "no fixed stop value -> data domain used");
+
+console.log("conditional formatting smoke test passed");
+
 const legacyReportConfig = {
   name: "legacy_donut",
   layouts: [
