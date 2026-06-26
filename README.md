@@ -59,6 +59,68 @@ After loading, the **検出事項 (Issues)** tab reports a PBIP integrity check
 page-order mismatches, etc.) so you can catch projects that would fail to open
 in Power BI.
 
+## Command line (CLI)
+
+The same analyzer that powers the browser app runs in Node (v18+), so you can
+inspect a PBIP from a terminal or a script. Input is a **project folder** or a
+**`.zip`**.
+
+```bash
+npm install            # installs jszip (.zip input) and the MCP SDK
+
+# Human-readable summary (pages / visuals / tables / 検査 / embedded data)
+node bin/cli.mjs analyze ./MyReport
+
+# Structured JSON (trimmed; add --raw for full file bodies, --pretty to format)
+node bin/cli.mjs analyze ./MyReport --json --pretty
+node bin/cli.mjs analyze ./MyReport.zip --json
+
+# Integrity check — prints problems and exits 1 if there are errors (CI gate)
+node bin/cli.mjs check ./MyReport && echo "Power BI で開けます"
+
+# Write a self-contained single-file HTML preview (offline; open in a browser)
+node bin/cli.mjs html ./MyReport -o preview.html
+```
+
+`check` exits with code **1** when the project has integrity errors and **0**
+otherwise, so it can gate a pipeline that generates PBIP files.
+
+If you `npm link` (or install globally), the `pbip-viewer` command is available
+directly: `pbip-viewer analyze ./MyReport`.
+
+## AI agents (MCP server)
+
+An [MCP](https://modelcontextprotocol.io) server exposes the analyzer to AI
+agents (Claude etc.), so an agent that generates PBIP files can verify them and
+read back the reproduced structure automatically.
+
+Register it with Claude Code:
+
+```bash
+claude mcp add pbip-viewer -- node /absolute/path/to/powerbi_viewer/bin/mcp.mjs
+```
+
+Or in Claude Desktop config (`claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "pbip-viewer": {
+      "command": "node",
+      "args": ["/absolute/path/to/powerbi_viewer/bin/mcp.mjs"]
+    }
+  }
+}
+```
+
+Tools provided:
+
+| Tool | Input | Returns |
+| --- | --- | --- |
+| `analyze_pbip` | `{ path, includeRaw? }` | Structured analysis JSON (pages, visuals, measures, embedded data, validation) |
+| `validate_pbip` | `{ path }` | `{ ok, errors, warnings, problems, summary }` — whether it would open in Power BI |
+| `render_pbip_html` | `{ path, outPath? }` | Writes a self-contained HTML preview, returns its path |
+
 ## Limitations
 
 PBIP projects usually do not contain imported data. This viewer does not run
