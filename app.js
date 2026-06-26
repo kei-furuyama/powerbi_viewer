@@ -4333,19 +4333,26 @@
       } else if (lowerType.includes("shape") && style.fill) {
         box.style.background = style.fill;
       }
-      // 枠線(visualContainerObjects.border): 色＋太さ
-      if (style.border?.show && style.border.color) {
+      // 枠線(visualContainerObjects.border): Power BIで「枠線」がオンのときだけ描く。
+      // 色未指定時はPower BIの既定枠線色(薄いグレー)。枠線があればビューア用の薄影は外す。
+      let bordered = false;
+      if (style.border?.show === true) {
         const bw = Number.isFinite(style.border.width) ? Math.max(1, Math.round(style.border.width)) : 1;
-        box.style.border = `${bw}px solid ${style.border.color}`;
+        box.style.border = `${bw}px solid ${style.border.color || "#E0E0E0"}`;
+        box.style.boxShadow = "none";
+        bordered = true;
       }
       if (Number.isFinite(style.border?.radius)) box.style.borderRadius = `${style.border.radius}px`;
       // 図形の枠線(line/outline)を反映
       if (lowerType.includes("shape") && style.line?.show && style.line.color) {
         box.style.border = `${Math.max(1, Math.round(style.line.weight || 1))}px solid ${style.line.color}`;
+        bordered = true;
       }
-      // ドロップシャドウ
+      // ドロップシャドウ(設定時のみ。設定されていれば薄影に優先)
       if (style.shadow?.show) {
         box.style.boxShadow = `0 2px 6px ${style.shadow.color}`;
+      } else if (bordered) {
+        box.style.boxShadow = "none";
       }
 
 

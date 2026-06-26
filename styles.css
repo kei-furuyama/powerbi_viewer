@@ -497,7 +497,10 @@ select {
   padding: 0;
   color: inherit;
   text-align: left;
-  border: 1px solid #c9c4b7;
+  /* Power BIは既定で枠線オフ。既定は透明枠線+ごく薄い影(ビューア用の視認性)のみ。
+     PBIPで枠線が設定されているビジュアルだけ renderCanvas が実枠線を描く。 */
+  border: 1px solid transparent;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.07);
   background: #fff;
   border-radius: 5px;
   min-width: 28px;
@@ -523,10 +526,11 @@ select {
   z-index: 3;
 }
 
-/* テキストボックス/図形は既定で背景・枠線を持たない(Power BIに合わせ透明) */
+/* テキストボックス/図形は既定で背景・枠線・影を持たない(Power BIに合わせ透明・フラット) */
 .visual-box.text-visual {
   background: transparent;
   border-color: transparent;
+  box-shadow: none;
 }
 
 .visual-box.text-visual .visual-body {
