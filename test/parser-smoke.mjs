@@ -1224,3 +1224,49 @@ console.log("slicer cross-filter data smoke test passed");
 }
 
 console.log("phase 1-4 audit fixes smoke test passed");
+
+// --- full-review audit fixes ---
+{
+  const M = new Map(); const tb = { columns: [], records: [{}] };
+  const dx = (e) => evaluateDax(e, [{}], tb, M);
+  assert.equal(dx("1e3"), 1000, "#20 scientific notation");
+  assert.equal(dx("1 + 2 // c\n+ 3"), 6, "#21 line comment");
+  assert.equal(dx("1 /* c */ + 2"), 3, "#21 block comment");
+  assert.equal(dx("ROUND(-2.5, 0)"), -3, "#22 ROUND half away from zero");
+  assert.equal(dx('"d=" & DATE(2024,3,5)'), "d=2024-03-05", "#23 & on Date");
+  assert.equal(dx('FORMAT(0.25, "Percent")'), "25.00%", "#4 FORMAT Percent");
+  assert.equal(dx('FORMAT(1234.5, "General Number")'), "1234.5", "#4 FORMAT General Number");
+}
+{
+  // #3 MIN/MAX over dates returns a Date
+  const dt = { name: "T", columns: [{ name: "D" }], records: [{ D: "2024-03-05" }, { D: "2024-01-15" }], measures: new Map() };
+  const m = new Map([["T", dt]]); m.relationships = [];
+  const r = evaluateDax("MIN(T[D])", dt.records, dt, m);
+  assert.ok(r instanceof Date && r.toISOString().slice(0, 10) === "2024-01-15", "#3 MIN over dates");
+}
+{
+  // #1 bare multi-line measure whose body starts with a keyword token ("Source")
+  const tmdl = ["table T", "\tmeasure M =", "\t\t\tCALCULATE(", "\t\t\t\tSUM(T[V]),", "\t\t\t\tSource = 1", "\t\t\t)", "\t\tformatString: 0", "\tcolumn V", "\t\tdataType: int64", "\tcolumn Source", "\t\tdataType: int64"].join("\n");
+  const parsed = parseTmdl(tmdl, "T", "T.tmdl");
+  const expr = parsed.tables[0].measures[0].expression;
+  assert.ok(/Source = 1/.test(expr) && /CALCULATE/.test(expr), "#1 multi-line body not truncated at keyword");
+}
+{
+  // #15 measures differing only by spaces are NOT a duplicate; #2 classifyRole tooltips
+  const tmdl = ["table T", "\tmeasure 'Total Sales' = 1", "\tmeasure TotalSales = 2", "\tcolumn k", "\t\tdataType: string"].join("\n");
+  const proj = analyzeProject([{ path: "D.SemanticModel/definition/tables/T.tmdl", text: tmdl, size: 120 }], []);
+  assert.ok(!proj.issues.some((i) => /メジャー名がモデル内で重複/.test(i.title)), "#15 spaced vs unspaced measures not duplicate");
+}
+{
+  // #16 macOS zip sidecar paths excluded — readEntriesFromZip is zip-only; emulate via analyzeProject filter is N/A.
+  // #14 check on a .Report folder detects a ghost pageOrder (validation runs)
+  const visual = { name: "v", position: { x: 0, y: 0, width: 100, height: 80, z: 0 }, visual: { visualType: "card" } };
+  const proj = analyzeProject([
+    { path: "X.Report/definition/pages/p1/page.json", text: JSON.stringify({ name: "p1", displayName: "P1", width: 1280, height: 720 }), size: 80 },
+    { path: "X.Report/definition/pages/p1/visuals/v/visual.json", text: JSON.stringify(visual), size: 100 },
+    { path: "X.Report/definition/pages/pages.json", text: JSON.stringify({ pageOrder: ["p1", "ghost"], activePageName: "p1" }), size: 60 },
+  ], []);
+  assert.ok((proj.validation.errors || 0) > 0, "#14 ghost pageOrder is a validation error");
+}
+
+console.log("full-review audit fixes smoke test passed");

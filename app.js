@@ -153,6 +153,7 @@
       const { entries, issues } = await readUploads(files);
       const project = analyzeProject(entries, issues);
       state.project = project;
+      state.crossFilter = null; // 新しいプロジェクトでは選択をリセット
       state.selectedPageId = project.report.pages[0]?.id || null;
       state.selectedVisualId = project.report.pages[0]?.visuals[0]?.id || null;
       // 検査でエラーがあれば検出事項タブを最初に表示
@@ -259,6 +260,8 @@
     zip.forEach((rawPath, entry) => {
       const path = normalizePath(rawPath);
       if (entry.dir) return;
+      // macOSのzipサイドカーは無視
+      if (/(^|\/)__MACOSX\//.test(path) || /(^|\/)\._/.test(path) || /(^|\/)\.DS_Store$/i.test(path)) return;
 
       const size = entry._data?.uncompressedSize || 0;
 
@@ -812,8 +815,12 @@
     "target", "min", "max", "x", "playaxis", "saturation",
   ]);
 
+  // 軸にもメジャーにもしないロール(ツールチップ等) → category/value プールから除外
+  const NONAXIS_ROLE_NAMES = new Set(["tooltips", "tooltip"]);
+
   function classifyRole(roleName, fieldKind) {
     const lower = String(roleName || "").toLowerCase();
+    if (NONAXIS_ROLE_NAMES.has(lower)) return "meta";
     if (fieldKind === "measure" || fieldKind === "aggregation") return "value";
     if (VALUE_ROLE_NAMES.has(lower)) return "value";
     return "category";
@@ -1137,10 +1144,19 @@
     const lo = Number.isFinite(stops[0].value) ? stops[0].value : domain?.min ?? 0;
     const hi = Number.isFinite(stops[stops.length - 1].value) ? stops[stops.length - 1].value : domain?.max ?? 1;
     if (hi === lo) return stops[stops.length - 1].color;
-    const t = Math.max(0, Math.min(1, (num - lo) / (hi - lo)));
     if (stops.length >= 3) {
-      return t < 0.5 ? interpolateColor(stops[0].color, stops[1].color, t / 0.5) : interpolateColor(stops[1].color, stops[2].color, (t - 0.5) / 0.5);
+      // 中央ストップの「値」を変曲点に使う(0.5固定ではない)
+      const mid = Number.isFinite(stops[1].value) ? stops[1].value : (lo + hi) / 2;
+      if (num <= mid) {
+        const d = mid - lo;
+        const t = d === 0 ? 0 : Math.max(0, Math.min(1, (num - lo) / d));
+        return interpolateColor(stops[0].color, stops[1].color, t);
+      }
+      const d = hi - mid;
+      const t = d === 0 ? 1 : Math.max(0, Math.min(1, (num - mid) / d));
+      return interpolateColor(stops[1].color, stops[2].color, t);
     }
+    const t = Math.max(0, Math.min(1, (num - lo) / (hi - lo)));
     return interpolateColor(stops[0].color, stops[stops.length - 1].color, t);
   }
 
@@ -1684,13 +1700,22 @@
       if (!path.toLowerCase().endsWith("model.bim")) continue;
       const tables = json.model?.tables || json.tables || [];
       for (const table of tables) {
+        // パーティションのMソースから埋め込みデータ(Table.FromRows)を抽出
+        let data;
+        for (const partition of table.partitions || []) {
+          const src = partition.source || {};
+          const expr = Array.isArray(src.expression) ? src.expression.join("\n") : (src.expression || src.query || src.m || "");
+          if (expr) { const inline = extractInlineData(String(expr)); if (inline) { data = inline; break; } }
+        }
         addTable({
           name: table.name,
           path,
+          data,
           columns: (table.columns || []).map((column) => ({
             name: column.name,
             dataType: column.dataType || column.type || "",
             sortByColumn: column.sortByColumn || "",
+            isHidden: column.isHidden === true,
           })),
           measures: (table.measures || []).map((measure) => ({
             name: measure.name,
@@ -1878,14 +1903,20 @@
         } else if (afterEq) {
           item.expression = afterEq;
         } else {
-          // 宣言行に式が無い場合、宣言よりも深いインデントの行を本文として収集
+          // 宣言行に式が無い場合、宣言よりも深いインデントの行を本文として収集。
+          // KNOWN_PROP/DECL は本文の基準インデント以下のときだけ終端扱い(DAX中の
+          // Description/Source 等の識別子で途切れないように)。
           const body = [];
           let lj = li + 1;
+          let bodyIndent = null;
           for (; lj < rawLines.length; lj += 1) {
             const rl = rawLines[lj];
             const t = rl.trim();
             if (!t) { body.push(rl); continue; }
-            if (indentOf(rl) <= indent || KNOWN_PROP.test(t) || DECL.test(t)) break;
+            const ind = indentOf(rl);
+            if (ind <= indent) break;
+            if (bodyIndent === null) bodyIndent = ind;
+            if (ind <= bodyIndent && (KNOWN_PROP.test(t) || DECL.test(t))) break;
             body.push(rl);
           }
           while (body.length && !body[body.length - 1].trim()) body.pop();
@@ -2183,6 +2214,13 @@
     while (i < n) {
       const c = text[i];
       if (/\s/.test(c)) { i += 1; continue; }
+      // コメント: // と -- は行末まで、/* */ はブロック
+      if ((c === "/" && text[i + 1] === "/") || (c === "-" && text[i + 1] === "-")) {
+        i += 2; while (i < n && text[i] !== "\n") i += 1; continue;
+      }
+      if (c === "/" && text[i + 1] === "*") {
+        i += 2; while (i < n && !(text[i] === "*" && text[i + 1] === "/")) i += 1; i += 2; continue;
+      }
       if (c === '"') {
         let j = i + 1; let s = "";
         while (j < n) { if (text[j] === '"') { if (text[j + 1] === '"') { s += '"'; j += 2; continue; } j += 1; break; } s += text[j++]; }
@@ -2200,6 +2238,11 @@
       }
       if (/[0-9]/.test(c) || (c === "." && /[0-9]/.test(text[i + 1] || ""))) {
         let j = i; while (j < n && /[0-9.]/.test(text[j])) j += 1;
+        // 指数表記 1e3 / 1.5E-2 に対応
+        if ((text[j] === "e" || text[j] === "E") && /[0-9+-]/.test(text[j + 1] || "")) {
+          j += 1; if (text[j] === "+" || text[j] === "-") j += 1;
+          while (j < n && /[0-9]/.test(text[j])) j += 1;
+        }
         tokens.push({ t: "num", v: Number(text.slice(i, j)) }); i = j; continue;
       }
       const two = text.slice(i, i + 2);
@@ -2337,6 +2380,7 @@
   // コンパイル済みDAX(VAR分解 + トークナイズ + パース)を式文字列でキャッシュ。
   // ASTは評価中に変更しないため再利用可能。メジャーは(カテゴリ×ビジュアル)で多数回評価されるため効く。
   const __daxCache = new Map();
+  const DAX_CACHE_LIMIT = 2000;
   function compileDax(expression) {
     let compiled = __daxCache.get(expression);
     if (!compiled) {
@@ -2345,6 +2389,8 @@
         vars: vars.map((v) => ({ name: v.name, ast: parseDax(tokenizeDax(v.expr)) })),
         bodyAst: parseDax(tokenizeDax(body)),
       };
+      // 上限超過時は最古を破棄(無制限な蓄積を防ぐ)
+      if (__daxCache.size >= DAX_CACHE_LIMIT) __daxCache.delete(__daxCache.keys().next().value);
       __daxCache.set(expression, compiled);
     }
     return compiled;
@@ -2499,7 +2545,7 @@
       case "-": return toNum(left) - toNum(right);
       case "*": return toNum(left) * toNum(right);
       case "/": return toNum(right) === 0 ? null : toNum(left) / toNum(right);
-      case "&": return `${left ?? ""}${right ?? ""}`;
+      case "&": return `${daxStr(left)}${daxStr(right)}`;
       case "=": return compareValues(left, right) === 0;
       case "<>": return compareValues(left, right) !== 0;
       case ">": return compareValues(left, right) > 0;
@@ -2624,11 +2670,19 @@
     const { table, key } = resolveDateColumn(ctx, node);
     if (!table || !key) return ctx.rows;
     const dateRows = table.records.filter((r) => { const d = toDate(r[key]); return d && inRange(d); });
-    if (table === ctx.table) return dateRows;
+    if (table === ctx.table) {
+      // 同一テーブル: 日付フィルタは置換しつつ、他のフィルタ(ctx.rowsの非日付列)は維持
+      if (!ctx.rows || ctx.rows.length === table.records.length) return dateRows;
+      const others = (table.columns || []).map((c) => c.name).filter((n) => n !== key);
+      const sig = (r) => others.map((c) => String(r[c] ?? "")).join("");
+      const allowed = new Set(ctx.rows.map(sig));
+      return dateRows.filter((r) => allowed.has(sig(r)));
+    }
+    // 別テーブル: 合致した日付キーを、現在のフィルタ済みファクト行(ctx.rows)へ写像
     const bridge = dateFactBridge(ctx, table);
     if (!bridge) return dateRows;
     const dateKeys = new Set(dateRows.map((r) => String(r[bridge.dateKeyCol] ?? "")));
-    return (ctx.table.records || ctx.rows || []).filter((r) => dateKeys.has(String(r[bridge.factCol] ?? "")));
+    return (ctx.rows || []).filter((r) => dateKeys.has(String(r[bridge.factCol] ?? "")));
   }
 
   // 期間単位(DAY/MONTH/QUARTER/YEAR)。素の識別子(name)はトークン文字列をそのまま使う
@@ -2699,9 +2753,13 @@
         return target.records.filter((r) => valSet.has(String(r[tkey] ?? "")));
       }
       if (name === "ALLEXCEPT") {
-        // ALLEXCEPT(table, cols…): 指定列のフィルタだけ残し、他は解除
-        const recs = ctx.table?.records || ctx.rows || [];
-        const keepCols = node.args.slice(1).map((a) => resolveColumn(ctx.table, a.name)).filter(Boolean);
+        // ALLEXCEPT(table, cols…): 指定列のフィルタだけ残し、他は解除。テーブルは引数で解決。
+        const a0 = node.args[0];
+        let allexTable = ctx.table;
+        if (a0?.type === "name" || a0?.type === "tableName") allexTable = ctx.model?.get(a0.name) || ctx.model?.get(normalizeName(a0.name)) || ctx.table;
+        else if (a0?.type === "col" && a0.table) allexTable = ctx.model?.get(a0.table) || ctx.model?.get(normalizeName(a0.table)) || ctx.table;
+        const recs = allexTable?.records || ctx.rows || [];
+        const keepCols = node.args.slice(1).map((a) => resolveColumn(allexTable, a.name)).filter(Boolean);
         if (!keepCols.length) return recs;
         const allowed = keepCols.map((c) => new Set((ctx.rows || []).map((r) => String(r[c] ?? ""))));
         return recs.filter((r) => keepCols.every((c, i) => allowed[i].has(String(r[c] ?? ""))));
@@ -2785,8 +2843,16 @@
       case "COUNTBLANK": return values.length - present.length;
       case "DISTINCTCOUNT": return new Set(present.map((value) => String(value))).size;
       case "AVERAGE": return numbers.length ? numbers.reduce((a, b) => a + b, 0) / numbers.length : null;
-      case "MIN": return numbers.length ? Math.min(...numbers) : null;
-      case "MAX": return numbers.length ? Math.max(...numbers) : null;
+      case "MIN":
+      case "MAX": {
+        // 日付列なら日付として比較し、Dateを返す(0/1899-12-30にならない)
+        const allDates = present.length && present.every((v) => v instanceof Date || (typeof v === "string" && /\d{4}[-/.]\d{1,2}[-/.]\d{1,2}/.test(v)));
+        if (allDates) {
+          const ts = present.map((v) => toDate(v)).filter(Boolean).map((d) => d.getTime());
+          if (ts.length) return new Date(func === "MIN" ? Math.min(...ts) : Math.max(...ts));
+        }
+        return numbers.length ? (func === "MIN" ? Math.min(...numbers) : Math.max(...numbers)) : null;
+      }
       case "PRODUCT": return numbers.reduce((a, b) => a * b, 1);
       case "MEDIAN": {
         if (!numbers.length) return null;
@@ -2810,11 +2876,15 @@
     if (name === "CALCULATE") {
       let rows = ctx.rows;
       let activeRel = ctx.activeRel;
-      for (const filter of args.slice(1)) {
+      const rest = args.slice(1);
+      // USERELATIONSHIPは位置に依らず先に解決(その後のフィルタへ反映)
+      for (const filter of rest) {
         if (filter.type === "call" && filter.name === "USERELATIONSHIP") {
           activeRel = relationshipForColumns(ctx, filter.args[0], filter.args[1]) || activeRel;
-          continue;
         }
+      }
+      for (const filter of rest) {
+        if (filter.type === "call" && filter.name === "USERELATIONSHIP") continue;
         rows = applyCalcFilter(rows, filter, { ...ctx, activeRel });
       }
       // 行コンテキストは保持(CALCULATE内のRELATED等が関連行をたどれるように)
@@ -2888,10 +2958,14 @@
       const value = evalDaxNode(args[0], ctx);
       if (value == null) return "";
       const pattern = String(evalDaxNode(args[1], ctx) || "");
-      // 日付値、または日付トークンを含むパターンの日付文字列は日付として整形
-      const isDatePattern = /[yYdD]|年|月|日/.test(pattern) && !/[#0%]/.test(pattern);
+      // 1) 名前付き書式(General Number/Currency/Percent/Yes-No 等)を最優先で判定
+      const named = formatNamed(value, pattern);
+      if (named != null) return named;
+      // 2) 日付値、または年トークン/年月日を含むパターンの日付文字列は日付として整形
+      const isDatePattern = /年|月|日/.test(pattern) || (/[yY]/.test(pattern) && !/[#0%]/.test(pattern));
       const date = value instanceof Date ? value : (isDatePattern ? toDate(value) : null);
       if (date) return formatDatePattern(date, pattern);
+      // 3) 数値書式(プレースホルダ #,##0.00 等)
       const numeric = typeof value === "number" ? value : Number(String(value).replace(/,/g, ""));
       if (Number.isFinite(numeric) && String(value).trim() !== "") {
         return formatMeasureValue(numeric, pattern);
@@ -3106,8 +3180,10 @@
   }
 
   function roundHalf(value, decimals) {
+    // DAXは0.5を「0から遠ざかる」方向に丸める(負値も)。Math.roundは+∞方向なので符号で補正。
     const factor = 10 ** decimals;
-    return Math.round(value * factor) / factor;
+    const scaled = value * factor;
+    return (Math.sign(scaled) * Math.round(Math.abs(scaled))) / factor;
   }
 
   const CALC_TABLE_FNS = new Set([
@@ -3132,10 +3208,20 @@
     return found;
   }
 
+  // タイムインテリジェンス関数: dateRowsInRange が既にファクト(ctx.table)空間の行を返すため再写像しない
+  const TIME_INTEL_FNS = new Set([
+    "DATESYTD", "DATESMTD", "DATESQTD", "SAMEPERIODLASTYEAR", "DATEADD", "DATESINPERIOD",
+    "PREVIOUSMONTH", "PREVIOUSYEAR", "PREVIOUSQUARTER",
+  ]);
+
   function applyCalcFilter(rows, node, ctx) {
     if (node.type === "call" && node.name === "USERELATIONSHIP") return rows; // CALCULATE側で処理
     if (node.type === "call" && node.name === "KEEPFILTERS") {
       return applyCalcFilter(rows, node.args[0], ctx);
+    }
+    // タイムインテリジェンスの結果は既にファクト空間 → そのまま採用(二重ブリッジを防ぐ)
+    if (node.type === "call" && TIME_INTEL_FNS.has(node.name)) {
+      return resolveTableArg(node, { ...ctx, rows });
     }
 
     let targetTable;
@@ -3165,6 +3251,26 @@
     const dimCol = resolveColumn(targetTable, factIsFrom ? rel.toColumn : rel.fromColumn);
     const keys = new Set(survivors.map((r) => String(r[dimCol] ?? "")));
     return rows.filter((r) => keys.has(String(r[factCol] ?? "")));
+  }
+
+  // VBA/DAXの名前付き書式。該当しなければ null を返す。
+  function formatNamed(value, pattern) {
+    const named = String(pattern).trim().toLowerCase();
+    const num = typeof value === "number" ? value : Number(String(value).replace(/,/g, ""));
+    const fin = Number.isFinite(num);
+    const grp = (n, dec) => groupThousands(roundTo(n, dec));
+    switch (named) {
+      case "general number": return fin ? String(roundTo(num, 6)) : String(value);
+      case "currency": return fin ? `¥${grp(num, 2)}` : String(value);
+      case "fixed": return fin ? num.toFixed(2) : String(value);
+      case "standard": return fin ? grp(num, 2) : String(value);
+      case "percent": return fin ? `${(num * 100).toFixed(2)}%` : String(value);
+      case "scientific": return fin ? num.toExponential(2) : String(value);
+      case "yes/no": return truthy(value) ? "Yes" : "No";
+      case "true/false": return truthy(value) ? "True" : "False";
+      case "on/off": return truthy(value) ? "On" : "Off";
+      default: return null;
+    }
   }
 
   function formatMeasureValue(value, formatString) {
@@ -3348,11 +3454,12 @@
         });
       }
 
-      // メジャー名のモデル内重複(Power BIはメジャー名のグローバル一意を要求)
+      // メジャー名のモデル内重複(Power BIはメジャー名のグローバル一意を要求)。
+      // 空白/アンダースコアの違いは別名なので identityName(畳み込みは大小のみ)で判定。
       const measureNameMap = new Map();
       for (const table of semantic.tables) {
         for (const measure of table.measures) {
-          const nn = normalizeName(measure.name);
+          const nn = identityName(measure.name);
           if (!measureNameMap.has(nn)) measureNameMap.set(nn, []);
           measureNameMap.get(nn).push(`${table.name}[${measure.name}]`);
         }
@@ -3422,8 +3529,8 @@
         const to = index.get(normalizeName(rel.toTable));
         if (rel.fromTable && !from) add("warning", "リレーションのテーブルが不明", `${rel.name || "relationship"}: ${rel.fromTable}`);
         if (rel.toTable && !to) add("warning", "リレーションのテーブルが不明", `${rel.name || "relationship"}: ${rel.toTable}`);
-        if (from && rel.fromColumn && !from.cols.has(normalizeName(rel.fromColumn))) add("warning", "リレーションの列が不明", `${rel.fromTable}[${rel.fromColumn}]`);
-        if (to && rel.toColumn && !to.cols.has(normalizeName(rel.toColumn))) add("warning", "リレーションの列が不明", `${rel.toTable}[${rel.toColumn}]`);
+        if (from && rel.fromColumn && !from.cols.has(normalizeName(rel.fromColumn))) add("error", "リレーションの列が存在しません", `${rel.fromTable}[${rel.fromColumn}]（Power BIで開けない可能性）`);
+        if (to && rel.toColumn && !to.cols.has(normalizeName(rel.toColumn))) add("error", "リレーションの列が存在しません", `${rel.toTable}[${rel.toColumn}]（Power BIで開けない可能性）`);
       }
     }
 
@@ -3528,9 +3635,9 @@
       return list[0];
     };
     const findColumn = (tableName, colName) => {
+      // テーブル修飾がある場合は、そのテーブルの完全一致のみ(別テーブルへフォールバックしない)
       if (tableName) {
-        const hit = columnByKey.get(`${identityName(tableName)}|${identityName(colName)}`);
-        if (hit) return hit;
+        return columnByKey.get(`${identityName(tableName)}|${identityName(colName)}`) || null;
       }
       const list = columnByNorm.get(normalizeName(colName));
       return list && list.length ? list[0] : null;
@@ -3556,6 +3663,9 @@
         }
       }
       for (const name of refs.bare) {
+        // 同一テーブルの完全一致列を最優先(別テーブルの同名メジャーへ誤束縛=偽の循環を防ぐ)
+        const sameTableCol = columnByKey.get(`${identityName(table.name)}|${identityName(name)}`);
+        if (sameTableCol) { cols.add(colKey(sameTableCol)); continue; }
         const mm = findMeasure(name, table.name);
         if (mm) { deps.add(measureId(mm.table, mm.measure)); continue; }
         const col = findColumn(table.name, name) || findColumn(null, name);
@@ -3852,8 +3962,9 @@
 
     // テーブル / マトリックス
     if (type.includes("table") || type.includes("pivot") || type.includes("matrix")) {
-      const catFields = [...categories, ...values].filter((field) => field.kind !== "measure");
-      const measureFields = [...categories, ...values].filter((field) => field.kind === "measure");
+      const isMeasureKind = (field) => field.kind === "measure" || field.kind === "aggregation";
+      const catFields = [...categories, ...values].filter((field) => !isMeasureKind(field));
+      const measureFields = [...categories, ...values].filter(isMeasureKind);
       const allFields = [...catFields, ...measureFields];
       const catColumns = catFields.map((field) => resolveColumn(table, field.name) || field.name);
 
@@ -3870,7 +3981,7 @@
       const shown = rowGroups.slice(0, ROW_LIMIT);
 
       const evalCache = (recs) => allFields.map((field) => {
-        if (field.kind === "measure") {
+        if (isMeasureKind(field)) {
           const ev = evaluateField(field, recs, table, model);
           const value = ev ? Number(ev.value) : null;
           return { text: ev ? formatMeasureValue(ev.value, ev.format) : "", raw: Number.isFinite(value) ? value : null };
@@ -3887,7 +3998,7 @@
 
       // 列が数値か(メジャーは数値、カテゴリ列は全数値なら数値)
       const numericCol = allFields.map((field, i) => {
-        if (field.kind === "measure") return true;
+        if (isMeasureKind(field)) return true;
         const col = catColumns[i];
         return records.some((r) => r[col] != null && r[col] !== "") && records.every((r) => r[col] == null || r[col] === "" || Number.isFinite(Number(r[col])));
       });
@@ -3895,7 +4006,7 @@
 
       // 合計行: メジャーは全レコードで評価、数値カテゴリ列は合計
       const totals = allFields.map((field, i) => {
-        if (field.kind === "measure") {
+        if (isMeasureKind(field)) {
           const ev = evaluateField(field, records, table, model);
           return ev ? formatMeasureValue(ev.value, ev.format) : "";
         }
@@ -3947,7 +4058,10 @@
     if (type.includes("map")) {
       const latField = fieldByRole(visual, /lat/i);
       const lonField = fieldByRole(visual, /lon/i);
-      const locColumn = categoryColumn || (latField ? null : resolveColumn(table, (categories[0] || values[0])?.name));
+      // ラベルは緯度経度ではなく場所(カテゴリ)列から取る
+      const locField = categories.find((f) => f.label !== latField?.label && f.label !== lonField?.label)
+        || (latField ? null : categories[0] || values[0]);
+      const locColumn = locField ? resolveColumn(table, locField.name) : null;
       const points = [];
       if (locColumn) {
         const groups = new Map();
@@ -5729,6 +5843,7 @@
   function loadEntriesForPreview(entries) {
     const project = analyzeProject(entries, []);
     state.project = project;
+    state.crossFilter = null;
     state.selectedPageId = project.report.pages[0]?.id || null;
     state.selectedVisualId = project.report.pages[0]?.visuals[0]?.id || null;
     state.activeTab = project.report.pages.length ? "canvas" : "issues";

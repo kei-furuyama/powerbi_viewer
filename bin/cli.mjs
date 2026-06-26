@@ -59,8 +59,14 @@ function parseArgs(argv) {
       else args.flags.table = argv[++i];
     } else if (a.startsWith("--")) {
       const eq = a.indexOf("=");
-      if (eq !== -1) args.flags[a.slice(2, eq)] = a.slice(eq + 1);
-      else args.flags[a.slice(2)] = true;
+      if (eq !== -1) {
+        const key = a.slice(2, eq);
+        const val = a.slice(eq + 1);
+        if (val === "") args.errors.push(`--${key}= には値が必要です。`);
+        else args.flags[key] = val;
+      } else {
+        args.flags[a.slice(2)] = true;
+      }
     } else {
       args._.push(a);
     }
