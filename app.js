@@ -822,8 +822,17 @@
     const legendProps = firstObjectProps(objects.legend);
     const labelsProps = firstObjectProps(objects.labels) || firstObjectProps(objects.dataLabels) || firstObjectProps(objects.detailLabels);
 
+    const lineProps = firstObjectProps(objects.line) || firstObjectProps(objects.outline);
+
     return {
       fill: readExprColor(fillProps?.fillColor) || readExprColor(fillProps?.color),
+      line: lineProps
+        ? {
+            color: readExprColor(lineProps.lineColor) || readExprColor(lineProps.color),
+            weight: readExprNumber(lineProps.weight) ?? readExprNumber(lineProps.lineWidth),
+            show: readExprBool(lineProps.show) !== false,
+          }
+        : null,
       title: {
         text: isDisplayText(titleText) ? titleText : "",
         color: readExprColor(titleProps?.fontColor),
@@ -3014,6 +3023,10 @@
       if (boxBackground) box.style.background = boxBackground;
       if (style.border?.show && style.border.color) box.style.borderColor = style.border.color;
       if (Number.isFinite(style.border?.radius)) box.style.borderRadius = `${style.border.radius}px`;
+      // 図形の枠線(line/outline)を反映
+      if (lowerType.includes("shape") && style.line?.show && style.line.color) {
+        box.style.border = `${Math.max(1, Math.round(style.line.weight || 1))}px solid ${style.line.color}`;
+      }
 
 
       const showTitle = visual.hasExplicitTitle;
@@ -3170,6 +3183,10 @@
       const legend = showLegend ? pieLegend(data.series, sliceColors || theme, data.format) : "";
       const pieHtml = `<div class="mini-pie" style="background:conic-gradient(${stops})" aria-hidden="true">${inner}</div>`;
       return `<div class="mini-pie-wrap legend-${escapeAttribute(showLegend ? position : "none")}">${pieHtml}${legend}</div>`;
+    }
+
+    if (type.includes("funnel") && data?.kind === "category" && data.series.length) {
+      return renderFunnel(data, theme, visual.style?.dataLabels?.show !== false);
     }
 
     if (type.includes("bar") || type.includes("column") || type.includes("histogram") || type.includes("funnel") || type.includes("waterfall") || type.includes("ribbon")) {
@@ -3414,10 +3431,42 @@
     return `<div class="mini-treemap labeled">${tiles}</div>`;
   }
 
+  function renderFunnel(data, theme, showLabels) {
+    const rows = data.series
+      .map((point, index) => {
+        const width = Math.max(0, (Math.abs(point.value) / data.max) * 100).toFixed(1);
+        const color = escapeAttribute(theme[index % theme.length]);
+        const valueText = formatMeasureValue(point.value, data.format);
+        return `<div class="funnel-row" title="${escapeAttribute(`${point.label}: ${valueText}`)}">
+          <span class="funnel-label">${escapeHtml(point.label)}</span>
+          <span class="funnel-track"><span class="funnel-bar" style="width:${width}%;background:${color}">${showLabels ? escapeHtml(valueText) : ""}</span></span>
+        </div>`;
+      })
+      .join("");
+    return `<div class="mini-funnel">${rows}</div>`;
+  }
+
   function renderScatter(data, theme) {
+    // X=第1メジャー, Y=第2メジャー, (任意)サイズ=第3 を実値で配置
+    if (data?.kind === "category" && data.seriesList?.length >= 2) {
+      const xs = data.seriesList[0].values;
+      const ys = data.seriesList[1].values;
+      const sizes = data.seriesList[2]?.values;
+      const xDom = seriesDomain(xs);
+      const yDom = seriesDomain(ys);
+      const sDom = sizes ? seriesDomain(sizes) : null;
+      const norm = (v, d) => (d.max === d.min ? 0.5 : (Number(v) - d.min) / (d.max - d.min));
+      const dots = data.categories.slice(0, 50).map((label, i) => {
+        const x = (6 + norm(xs[i], xDom) * 88).toFixed(1);
+        const y = (92 - norm(ys[i], yDom) * 84).toFixed(1);
+        const sz = (sizes ? 5 + norm(sizes[i], sDom) * 16 : 8).toFixed(0);
+        return `<span style="left:${x}%;top:${y}%;width:${sz}px;height:${sz}px;background:${escapeAttribute(theme[0])}" title="${escapeAttribute(label || "")}"></span>`;
+      }).join("");
+      return `<div class="mini-scatter" aria-hidden="true">${dots}</div>`;
+    }
+    // フォールバック(X/Yが無い場合は擬似配置)
     const series = data?.kind === "category" ? data.series : [];
     const max = data?.max || 1;
-    // 値の大小で点の位置・サイズを散らす(擬似配置)
     const dots = (series.length ? series : Array.from({ length: 6 }, (_, i) => ({ value: (i + 1) * (max / 6), label: "" })))
       .slice(0, 16)
       .map((point, index) => {

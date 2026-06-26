@@ -751,6 +751,39 @@ assert.equal(neProject.report.pages[0].visuals[0].data.text, "1", "<> (not equal
 
 console.log("audit fixes smoke test passed");
 
+// --- 続き: scatter X/Y, shape line ---
+const ct2Tmdl = [
+  "table T",
+  "\tmeasure X = SUM('T'[x])",
+  "\tmeasure Y = SUM('T'[y])",
+  "\tcolumn k", "\t\tdataType: string",
+  "\tcolumn x", "\t\tdataType: int64",
+  "\tcolumn y", "\t\tdataType: int64",
+  "\tpartition T = m", "\t\tsource =",
+  "\t\t\tlet Source = Table.FromRows({ {\"A\",10,80},{\"B\",90,20} }, type table [k=text, x=Int64.Type, y=Int64.Type]) in Source",
+].join("\n");
+const ct2M = (p) => ({ field: { Measure: { Expression: { SourceRef: { Entity: "T" } }, Property: p } }, queryRef: "T." + p, nativeQueryRef: p });
+const ct2C = (p) => ({ field: { Column: { Expression: { SourceRef: { Entity: "T" } }, Property: p } }, queryRef: "T." + p, nativeQueryRef: p });
+const ct2Project = analyzeProject(
+  [
+    { path: "C2.pbip", text: JSON.stringify({ version: "1.0", artifacts: [{ report: { path: "C2.Report" } }] }), size: 40 },
+    { path: "C2.Report/definition/pages/pages.json", text: JSON.stringify({ pageOrder: ["P"] }), size: 30 },
+    { path: "C2.Report/definition/pages/P/page.json", text: JSON.stringify({ name: "P", displayName: "P", width: 1280, height: 720 }), size: 60 },
+    { path: "C2.Report/definition/pages/P/visuals/sc/visual.json", text: JSON.stringify({ name: "sc", position: { x: 0, y: 0, width: 300, height: 200, z: 0 }, visual: { visualType: "scatterChart", query: { queryState: { Category: { projections: [ct2C("k")] }, X: { projections: [ct2M("X")] }, Y: { projections: [ct2M("Y")] } } } } }), size: 200 },
+    { path: "C2.Report/definition/pages/P/visuals/sh/visual.json", text: JSON.stringify({ name: "sh", position: { x: 0, y: 220, width: 300, height: 120, z: 0 }, visual: { visualType: "shape", objects: { line: [{ properties: { lineColor: { solid: { color: { expr: { Literal: { Value: "'#1F5FA6'" } } } } }, weight: { expr: { Literal: { Value: "4D" } } } } }] } } }), size: 200 },
+    { path: "C2.SemanticModel/definition/tables/T.tmdl", text: ct2Tmdl, size: 300 },
+  ],
+  [],
+);
+const sc = ct2Project.report.pages[0].visuals.find((v) => v.id === "sc").data;
+assert.ok(sc.seriesList.length >= 2, "scatter has X and Y series");
+assert.deepEqual(sc.seriesList[0].values.slice().sort((a, b) => a - b), [10, 90], "scatter X measure values");
+const sh = ct2Project.report.pages[0].visuals.find((v) => v.id === "sh");
+assert.equal(sh.style.line.color, "#1F5FA6", "shape line color");
+assert.equal(sh.style.line.weight, 4, "shape line weight");
+
+console.log("continue fixes smoke test passed");
+
 const legacyReportConfig = {
   name: "legacy_donut",
   layouts: [
