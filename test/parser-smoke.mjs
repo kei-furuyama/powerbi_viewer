@@ -1050,3 +1050,51 @@ assert.equal(jpCols["未使用"].used, false, "未使用 column detected");
 assert.ok(jpProject.measureUsage.cycles.some((ring) => ring.join().includes("自己")), "self-reference cycle detected (#6)");
 
 console.log("review regression smoke test passed");
+
+// --- extended DAX functions (date / math / text / info / table) ---
+const dx = (expr) => evaluateDax(expr, [{}], { columns: [], records: [{}] }, new Map());
+assert.equal(dx("YEAR(DATE(2024,3,15))"), 2024, "YEAR(DATE())");
+assert.equal(dx("MONTH(DATE(2024,3,15))"), 3, "MONTH");
+assert.equal(dx('DATEDIFF(DATE(2024,1,1), DATE(2024,3,1), "DAY")'), 60, "DATEDIFF DAY");
+assert.equal(dx('DATEDIFF(DATE(2024,1,15), DATE(2024,3,10), "MONTH")'), 2, "DATEDIFF MONTH");
+assert.equal(dx("DAY(EOMONTH(DATE(2024,2,10),0))"), 29, "EOMONTH leap");
+assert.equal(dx("MONTH(EDATE(DATE(2024,1,31),1))"), 2, "EDATE");
+assert.equal(dx("WEEKDAY(DATE(2024,3,4),2)"), 1, "WEEKDAY Monday type2");
+assert.equal(dx('YEAR("2023-07-09")'), 2023, "YEAR of date string");
+assert.equal(dx('FORMAT(DATE(2024,3,5),"yyyy/MM/dd")'), "2024/03/05", "FORMAT date");
+assert.equal(dx("POWER(2,10)"), 1024, "POWER");
+assert.equal(dx("MOD(10,3)"), 1, "MOD");
+assert.equal(dx("CEILING(23,10)"), 30, "CEILING");
+assert.equal(dx("SQRT(144)"), 12, "SQRT");
+assert.equal(dx("QUOTIENT(17,5)"), 3, "QUOTIENT");
+assert.equal(dx('LEFT("abcdef",3)'), "abc", "LEFT");
+assert.equal(dx('MID("abcdef",2,3)'), "bcd", "MID");
+assert.equal(dx('LEN("あいう")'), 3, "LEN");
+assert.equal(dx('SUBSTITUTE("a-b-c","-","+")'), "a+b+c", "SUBSTITUTE");
+assert.equal(dx('FIND("c","abcde")'), 3, "FIND");
+assert.equal(dx('VALUE("1,234")'), 1234, "VALUE");
+assert.equal(dx("ISBLANK(BLANK())"), true, "ISBLANK");
+assert.equal(dx("ISNUMBER(5)"), true, "ISNUMBER");
+
+// table functions over inline data: TOPN / MEDIAN / CONCATENATEX / RANKX
+const dxTmdl = [
+  "table S",
+  "\tcolumn 地域", "\t\tdataType: string",
+  "\tcolumn 金額", "\t\tdataType: int64",
+  "\tmeasure TOP3 = SUMX(TOPN(3, S, [金額]), [金額])",
+  "\tmeasure 中央 = MEDIAN(S[金額])",
+  "\tmeasure 連結 = CONCATENATEX(TOPN(2, S, [金額]), S[地域], \"|\")",
+  "\tmeasure R250 = RANKX(S, [金額], 250)",
+  "\tpartition S = m", "\t\tsource =",
+  "\t\t\tlet Source = Table.FromRows({ {\"東\",300},{\"西\",100},{\"南\",250},{\"北\",50},{\"中\",150} }, type table [地域 = text, 金額 = Int64.Type]) in Source",
+].join("\n");
+const dxProject = analyzeProject([{ path: "DX.SemanticModel/definition/tables/S.tmdl", text: dxTmdl, size: 400 }], []);
+const dxTable = dxProject.semantic.tables[0];
+const dxModel = new Map([[dxTable.name, { name: dxTable.name, columns: dxTable.data.columns, records: dxTable.data.records, measures: new Map(dxTable.measures.map((m) => [m.name, m])) }]]);
+const dxEv = (n) => evaluateDax(dxTable.measures.find((m) => m.name === n).expression, dxTable.data.records, dxModel.get(dxTable.name), dxModel);
+assert.equal(dxEv("TOP3"), 700, "SUMX(TOPN(3)) = 300+250+150");
+assert.equal(dxEv("中央"), 150, "MEDIAN");
+assert.equal(dxEv("連結"), "東|南", "CONCATENATEX over TOPN(2)");
+assert.equal(dxEv("R250"), 2, "RANKX of 250 desc = 2");
+
+console.log("extended DAX functions smoke test passed");

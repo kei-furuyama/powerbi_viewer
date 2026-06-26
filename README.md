@@ -54,6 +54,15 @@ To reproduce **actual numbers**, the semantic model must embed data in a TMDL
 partition via `Table.FromRows(...)`. Models that only reference an external
 source render shapes/labels without values.
 
+A built-in DAX engine evaluates measures over that embedded data. Supported
+functions include aggregations (`SUM`/`AVERAGE`/`MIN`/`MAX`/`COUNT`/
+`DISTINCTCOUNT`/`MEDIAN`…), iterators (`SUMX`/`AVERAGEX`/`RANKX`/
+`CONCATENATEX`…), filter/table (`CALCULATE`/`FILTER`/`TOPN`/`ALL`/`VALUES`),
+logic (`IF`/`SWITCH`/`AND`/`OR`/`COALESCE`), date/time (`DATE`/`YEAR`/`MONTH`/
+`DATEDIFF`/`EOMONTH`/`EDATE`/`WEEKDAY`/`TODAY`…), text (`LEFT`/`MID`/`LEN`/
+`SUBSTITUTE`/`FIND`/`FORMAT`…), and math (`ROUND`/`DIVIDE`/`POWER`/`MOD`/
+`CEILING`…). It is an approximation, not the full Power BI engine.
+
 After loading, the **検出事項 (Issues)** tab reports a PBIP integrity check
 (broken JSON, missing files, references to non-existent tables/columns/measures,
 page-order mismatches, etc.) so you can catch projects that would fail to open

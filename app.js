@@ -2220,6 +2220,7 @@
   }
 
   function toNum(value) {
+    if (value instanceof Date) return Number.isNaN(value.getTime()) ? 0 : (value.getTime() - DAX_EPOCH) / 86400000;
     if (value == null || value === "" || value === false) return 0;
     if (value === true) return 1;
     const number = Number(value);
@@ -2228,6 +2229,35 @@
 
   function isBlank(value) {
     return value == null || value === "";
+  }
+
+  // --- DAX 日付サポート(シリアル=1899-12-30からの日数, UTC基準) -----------
+  const DAX_EPOCH = Date.UTC(1899, 11, 30);
+
+  function toDate(value) {
+    if (value instanceof Date) return Number.isNaN(value.getTime()) ? null : value;
+    if (typeof value === "number" && Number.isFinite(value)) return new Date(DAX_EPOCH + value * 86400000);
+    if (typeof value === "string") {
+      const s = value.trim();
+      const m = s.match(/^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})(?:[ T](\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?/);
+      if (m) return new Date(Date.UTC(+m[1], +m[2] - 1, +m[3], +(m[4] || 0), +(m[5] || 0), +(m[6] || 0)));
+      const t = Date.parse(s);
+      if (!Number.isNaN(t)) return new Date(t);
+    }
+    return null;
+  }
+
+  function makeUTCDate(y, m, d, hh = 0, mm = 0, ss = 0) {
+    return new Date(Date.UTC(y, m - 1, d, hh, mm, ss));
+  }
+
+  function addMonths(date, months) {
+    const y = date.getUTCFullYear();
+    const m = date.getUTCMonth() + months;
+    const day = date.getUTCDate();
+    const target = new Date(Date.UTC(y, m, 1));
+    const lastDay = new Date(Date.UTC(target.getUTCFullYear(), target.getUTCMonth() + 1, 0)).getUTCDate();
+    return new Date(Date.UTC(target.getUTCFullYear(), target.getUTCMonth(), Math.min(day, lastDay)));
   }
 
   function evalDaxNode(node, ctx) {
@@ -2311,6 +2341,11 @@
   }
 
   function compareValues(a, b) {
+    if (a instanceof Date || b instanceof Date) {
+      const ta = toDate(a)?.getTime() ?? NaN;
+      const tb = toDate(b)?.getTime() ?? NaN;
+      return ta === tb ? 0 : ta < tb ? -1 : 1;
+    }
     if (typeof a === "number" || typeof b === "number") {
       const na = toNum(a); const nb = toNum(b);
       return na === nb ? 0 : na < nb ? -1 : 1;
@@ -2322,13 +2357,14 @@
   function truthy(value) {
     if (value === true) return true;
     if (value === false || value == null) return false;
+    if (value instanceof Date) return true;
     if (typeof value === "number") return value !== 0;
     if (value === "") return false;
     return true;
   }
 
-  const DAX_AGGREGATIONS = new Set(["SUM", "AVERAGE", "MIN", "MAX", "COUNT", "COUNTA", "COUNTBLANK", "DISTINCTCOUNT", "PRODUCT"]);
-  const DAX_ITERATORS = new Set(["SUMX", "AVERAGEX", "MINX", "MAXX", "COUNTX", "COUNTAX", "PRODUCTX"]);
+  const DAX_AGGREGATIONS = new Set(["SUM", "AVERAGE", "MIN", "MAX", "COUNT", "COUNTA", "COUNTBLANK", "DISTINCTCOUNT", "PRODUCT", "MEDIAN", "GEOMEAN"]);
+  const DAX_ITERATORS = new Set(["SUMX", "AVERAGEX", "MINX", "MAXX", "COUNTX", "COUNTAX", "PRODUCTX", "MEDIANX", "GEOMEANX"]);
 
   function resolveTableArg(node, ctx) {
     if (!node) return ctx.rows;
@@ -2337,6 +2373,15 @@
       if (name === "FILTER") {
         const base = resolveTableArg(node.args[0], ctx);
         return base.filter((row) => truthy(evalDaxNode(node.args[1], { ...ctx, row, rows: base })));
+      }
+      if (name === "TOPN") {
+        const count = Math.max(0, Math.trunc(toNum(evalDaxNode(node.args[0], ctx))));
+        const base = resolveTableArg(node.args[1], ctx);
+        const orderExpr = node.args[2];
+        const desc = node.args[3] ? toNum(evalDaxNode(node.args[3], ctx)) !== 0 : true; // 既定はDESC
+        const scored = base.map((row) => ({ row, key: orderExpr ? evalDaxNode(orderExpr, { ...ctx, row, rows: base }) : 0 }));
+        scored.sort((a, b) => (desc ? -1 : 1) * compareValues(a.key, b.key));
+        return scored.slice(0, count).map((entry) => entry.row);
       }
       if (name === "ALL" || name === "ALLSELECTED" || name === "VALUES" || name === "DISTINCT") {
         return ctx.table?.records || ctx.rows;
@@ -2364,6 +2409,17 @@
       case "MIN": return numbers.length ? Math.min(...numbers) : null;
       case "MAX": return numbers.length ? Math.max(...numbers) : null;
       case "PRODUCT": return numbers.reduce((a, b) => a * b, 1);
+      case "MEDIAN": {
+        if (!numbers.length) return null;
+        const sorted = [...numbers].sort((a, b) => a - b);
+        const mid = Math.floor(sorted.length / 2);
+        return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+      }
+      case "GEOMEAN": {
+        const pos = numbers.filter((x) => x > 0);
+        if (!pos.length) return null;
+        return Math.exp(pos.reduce((a, b) => a + Math.log(b), 0) / pos.length);
+      }
       default: return numbers.reduce((a, b) => a + b, 0);
     }
   }
@@ -2412,10 +2468,14 @@
     if (name === "FORMAT") {
       const value = evalDaxNode(args[0], ctx);
       if (value == null) return "";
-      const pattern = evalDaxNode(args[1], ctx);
+      const pattern = String(evalDaxNode(args[1], ctx) || "");
+      // 日付値、または日付トークンを含むパターンの日付文字列は日付として整形
+      const isDatePattern = /[yYdD]|年|月|日/.test(pattern) && !/[#0%]/.test(pattern);
+      const date = value instanceof Date ? value : (isDatePattern ? toDate(value) : null);
+      if (date) return formatDatePattern(date, pattern);
       const numeric = typeof value === "number" ? value : Number(String(value).replace(/,/g, ""));
       if (Number.isFinite(numeric) && String(value).trim() !== "") {
-        return formatMeasureValue(numeric, String(pattern || ""));
+        return formatMeasureValue(numeric, pattern);
       }
       return String(value);
     }
@@ -2457,12 +2517,163 @@
     if (name === "FALSE") return false;
 
     if (name === "ABS") return Math.abs(toNum(evalDaxNode(args[0], ctx)));
-    if (name === "INT") return Math.trunc(toNum(evalDaxNode(args[0], ctx)));
+    if (name === "INT") return Math.floor(toNum(evalDaxNode(args[0], ctx)));
     if (name === "ROUND") return roundHalf(toNum(evalDaxNode(args[0], ctx)), toNum(evalDaxNode(args[1], ctx)));
     if (name === "ROUNDUP") { const f = 10 ** toNum(evalDaxNode(args[1], ctx)); return Math.ceil(toNum(evalDaxNode(args[0], ctx)) * f) / f; }
     if (name === "ROUNDDOWN") { const f = 10 ** toNum(evalDaxNode(args[1], ctx)); return Math.floor(toNum(evalDaxNode(args[0], ctx)) * f) / f; }
 
+    // --- 数学 ---
+    if (name === "POWER") return toNum(evalDaxNode(args[0], ctx)) ** toNum(evalDaxNode(args[1], ctx));
+    if (name === "SQRT") return Math.sqrt(toNum(evalDaxNode(args[0], ctx)));
+    if (name === "EXP") return Math.exp(toNum(evalDaxNode(args[0], ctx)));
+    if (name === "LN") return Math.log(toNum(evalDaxNode(args[0], ctx)));
+    if (name === "LOG10") return Math.log10(toNum(evalDaxNode(args[0], ctx)));
+    if (name === "LOG") { const x = toNum(evalDaxNode(args[0], ctx)); const base = args[1] ? toNum(evalDaxNode(args[1], ctx)) : 10; return Math.log(x) / Math.log(base); }
+    if (name === "MOD") { const a = toNum(evalDaxNode(args[0], ctx)); const b = toNum(evalDaxNode(args[1], ctx)); return b === 0 ? null : a - b * Math.floor(a / b); }
+    if (name === "QUOTIENT") { const a = toNum(evalDaxNode(args[0], ctx)); const b = toNum(evalDaxNode(args[1], ctx)); return b === 0 ? null : Math.trunc(a / b); }
+    if (name === "SIGN") return Math.sign(toNum(evalDaxNode(args[0], ctx)));
+    if (name === "TRUNC") { const x = toNum(evalDaxNode(args[0], ctx)); const n = args[1] ? toNum(evalDaxNode(args[1], ctx)) : 0; const f = 10 ** n; return Math.trunc(x * f) / f; }
+    if (name === "CEILING") { const x = toNum(evalDaxNode(args[0], ctx)); const sig = args[1] ? toNum(evalDaxNode(args[1], ctx)) : 1; return sig === 0 ? 0 : Math.ceil(x / sig) * sig; }
+    if (name === "FLOOR") { const x = toNum(evalDaxNode(args[0], ctx)); const sig = args[1] ? toNum(evalDaxNode(args[1], ctx)) : 1; return sig === 0 ? 0 : Math.floor(x / sig) * sig; }
+    if (name === "PI") return Math.PI;
+    if (name === "EVEN") { const x = Math.ceil(Math.abs(toNum(evalDaxNode(args[0], ctx)))); const e = x % 2 ? x + 1 : x; return Math.sign(toNum(evalDaxNode(args[0], ctx))) < 0 ? -e : e; }
+    if (name === "ODD") { const x = Math.ceil(Math.abs(toNum(evalDaxNode(args[0], ctx)))); const o = x % 2 ? x : x + 1; return Math.sign(toNum(evalDaxNode(args[0], ctx))) < 0 ? -(o || 1) : (o || 1); }
+
+    // --- 日付/時刻 ---
+    if (name === "DATE") return makeUTCDate(toNum(evalDaxNode(args[0], ctx)), toNum(evalDaxNode(args[1], ctx)), toNum(evalDaxNode(args[2], ctx)));
+    if (name === "TIME") { const h = toNum(evalDaxNode(args[0], ctx)); const m = toNum(evalDaxNode(args[1], ctx)); const s = args[2] ? toNum(evalDaxNode(args[2], ctx)) : 0; return (h * 3600 + m * 60 + s) / 86400; }
+    if (name === "TODAY" || name === "NOW") { const now = new Date(); return name === "TODAY" ? makeUTCDate(now.getUTCFullYear(), now.getUTCMonth() + 1, now.getUTCDate()) : now; }
+    if (name === "YEAR") { const d = toDate(evalDaxNode(args[0], ctx)); return d ? d.getUTCFullYear() : null; }
+    if (name === "MONTH") { const d = toDate(evalDaxNode(args[0], ctx)); return d ? d.getUTCMonth() + 1 : null; }
+    if (name === "DAY") { const d = toDate(evalDaxNode(args[0], ctx)); return d ? d.getUTCDate() : null; }
+    if (name === "HOUR") { const d = toDate(evalDaxNode(args[0], ctx)); return d ? d.getUTCHours() : null; }
+    if (name === "MINUTE") { const d = toDate(evalDaxNode(args[0], ctx)); return d ? d.getUTCMinutes() : null; }
+    if (name === "SECOND") { const d = toDate(evalDaxNode(args[0], ctx)); return d ? d.getUTCSeconds() : null; }
+    if (name === "WEEKDAY") { const d = toDate(evalDaxNode(args[0], ctx)); if (!d) return null; const type = args[1] ? toNum(evalDaxNode(args[1], ctx)) : 1; const dow = d.getUTCDay(); return type === 2 ? (dow === 0 ? 7 : dow) : type === 3 ? (dow + 6) % 7 : dow + 1; }
+    if (name === "WEEKNUM") { const d = toDate(evalDaxNode(args[0], ctx)); if (!d) return null; const start = Date.UTC(d.getUTCFullYear(), 0, 1); return Math.floor((d.getTime() - start) / 86400000 / 7) + 1; }
+    if (name === "DATEVALUE") return toDate(evalDaxNode(args[0], ctx));
+    if (name === "EDATE") { const d = toDate(evalDaxNode(args[0], ctx)); return d ? addMonths(d, Math.trunc(toNum(evalDaxNode(args[1], ctx)))) : null; }
+    if (name === "EOMONTH") { const d = toDate(evalDaxNode(args[0], ctx)); if (!d) return null; const moved = addMonths(d, Math.trunc(toNum(evalDaxNode(args[1], ctx)))); return new Date(Date.UTC(moved.getUTCFullYear(), moved.getUTCMonth() + 1, 0)); }
+    if (name === "DATEDIFF") { const d1 = toDate(evalDaxNode(args[0], ctx)); const d2 = toDate(evalDaxNode(args[1], ctx)); if (!d1 || !d2) return null; return dateDiff(d1, d2, String(args[2] ? evalDaxNode(args[2], ctx) : "DAY")); }
+
+    // --- テキスト ---
+    if (name === "CONCATENATE") return `${daxStr(evalDaxNode(args[0], ctx))}${daxStr(evalDaxNode(args[1], ctx))}`;
+    if (name === "LEN") return daxStr(evalDaxNode(args[0], ctx)).length;
+    if (name === "UPPER") return daxStr(evalDaxNode(args[0], ctx)).toUpperCase();
+    if (name === "LOWER") return daxStr(evalDaxNode(args[0], ctx)).toLowerCase();
+    if (name === "TRIM") return daxStr(evalDaxNode(args[0], ctx)).replace(/\s+/g, " ").trim();
+    if (name === "LEFT") { const s = daxStr(evalDaxNode(args[0], ctx)); const n = args[1] ? Math.trunc(toNum(evalDaxNode(args[1], ctx))) : 1; return s.slice(0, Math.max(0, n)); }
+    if (name === "RIGHT") { const s = daxStr(evalDaxNode(args[0], ctx)); const n = args[1] ? Math.trunc(toNum(evalDaxNode(args[1], ctx))) : 1; return n <= 0 ? "" : s.slice(-n); }
+    if (name === "MID") { const s = daxStr(evalDaxNode(args[0], ctx)); const start = Math.trunc(toNum(evalDaxNode(args[1], ctx))); const len = Math.trunc(toNum(evalDaxNode(args[2], ctx))); return s.slice(Math.max(0, start - 1), Math.max(0, start - 1) + Math.max(0, len)); }
+    if (name === "REPT") { const s = daxStr(evalDaxNode(args[0], ctx)); const n = Math.max(0, Math.trunc(toNum(evalDaxNode(args[1], ctx)))); return s.repeat(n); }
+    if (name === "SUBSTITUTE") { const s = daxStr(evalDaxNode(args[0], ctx)); const oldT = daxStr(evalDaxNode(args[1], ctx)); const newT = daxStr(evalDaxNode(args[2], ctx)); return oldT === "" ? s : s.split(oldT).join(newT); }
+    if (name === "REPLACE") { const s = daxStr(evalDaxNode(args[0], ctx)); const start = Math.trunc(toNum(evalDaxNode(args[1], ctx))); const len = Math.trunc(toNum(evalDaxNode(args[2], ctx))); const newT = daxStr(evalDaxNode(args[3], ctx)); return s.slice(0, Math.max(0, start - 1)) + newT + s.slice(Math.max(0, start - 1) + Math.max(0, len)); }
+    if (name === "FIND" || name === "SEARCH") { let hay = daxStr(evalDaxNode(args[1], ctx)); let needle = daxStr(evalDaxNode(args[0], ctx)); const start = args[2] ? Math.trunc(toNum(evalDaxNode(args[2], ctx))) : 1; if (name === "SEARCH") { hay = hay.toLowerCase(); needle = needle.toLowerCase(); } const idx = hay.indexOf(needle, Math.max(0, start - 1)); if (idx < 0) return args[3] ? evalDaxNode(args[3], ctx) : null; return idx + 1; }
+    if (name === "VALUE") { const v = evalDaxNode(args[0], ctx); const num = typeof v === "number" ? v : Number(String(v).replace(/,/g, "")); return Number.isFinite(num) ? num : null; }
+    if (name === "UNICHAR") { const code = Math.trunc(toNum(evalDaxNode(args[0], ctx))); return code > 0 ? String.fromCodePoint(code) : ""; }
+
+    // --- 反復(テーブル)系 ---
+    if (name === "CONCATENATEX") {
+      const rows = resolveTableArg(args[0], ctx);
+      const delim = args[2] ? daxStr(evalDaxNode(args[2], { ...ctx, row: rows[0] })) : "";
+      return rows.map((row) => daxStr(evalDaxNode(args[1], { ...ctx, row, rows }))).join(delim);
+    }
+    if (name === "RANKX") {
+      const rows = resolveTableArg(args[0], ctx);
+      const scoreExpr = args[1];
+      const scores = rows.map((row) => toNum(evalDaxNode(scoreExpr, { ...ctx, row, rows })));
+      const current = args[2] ? toNum(evalDaxNode(args[2], ctx)) : toNum(evalDaxNode(scoreExpr, ctx));
+      const desc = args[3] ? toNum(evalDaxNode(args[3], ctx)) === 0 : true; // 既定DESC(1=ASC)
+      let rank = 1;
+      for (const score of scores) {
+        if (desc ? score > current : score < current) rank += 1;
+      }
+      return rank;
+    }
+
+    // --- 情報/論理 ---
+    if (name === "ISBLANK") return isBlank(evalDaxNode(args[0], ctx));
+    if (name === "ISNUMBER") { const v = evalDaxNode(args[0], ctx); return typeof v === "number" && Number.isFinite(v); }
+    if (name === "ISTEXT") return typeof evalDaxNode(args[0], ctx) === "string";
+    if (name === "ISERROR") return false;
+    if (name === "ISEVEN") return Math.trunc(toNum(evalDaxNode(args[0], ctx))) % 2 === 0;
+    if (name === "ISODD") return Math.abs(Math.trunc(toNum(evalDaxNode(args[0], ctx))) % 2) === 1;
+    if (name === "SELECTEDVALUE") {
+      const rows = ctx.rows || [];
+      const col = args[0];
+      const values = new Set(rows.map((row) => daxStr(evalDaxNode(col, { ...ctx, row }))));
+      if (values.size === 1) return evalDaxNode(col, { ...ctx, row: rows[0] });
+      return args[1] ? evalDaxNode(args[1], ctx) : null;
+    }
+    if (name === "HASONEVALUE") {
+      const rows = ctx.rows || [];
+      const col = args[0];
+      const values = new Set(rows.map((row) => daxStr(evalDaxNode(col, { ...ctx, row }))));
+      return values.size === 1;
+    }
+
     return null;
+  }
+
+  function daxStr(value) {
+    if (value == null) return "";
+    if (value instanceof Date) return formatDate(value, "yyyy-MM-dd");
+    return String(value);
+  }
+
+  function dateDiff(d1, d2, unit) {
+    const u = String(unit || "DAY").toUpperCase().replace(/['"]/g, "");
+    const ms = d2.getTime() - d1.getTime();
+    switch (u) {
+      case "SECOND": return Math.trunc(ms / 1000);
+      case "MINUTE": return Math.trunc(ms / 60000);
+      case "HOUR": return Math.trunc(ms / 3600000);
+      case "DAY": return Math.trunc(ms / 86400000);
+      case "WEEK": return Math.trunc(ms / 86400000 / 7);
+      case "MONTH": return (d2.getUTCFullYear() - d1.getUTCFullYear()) * 12 + (d2.getUTCMonth() - d1.getUTCMonth());
+      case "QUARTER": return Math.trunc(((d2.getUTCFullYear() - d1.getUTCFullYear()) * 12 + (d2.getUTCMonth() - d1.getUTCMonth())) / 3);
+      case "YEAR": return d2.getUTCFullYear() - d1.getUTCFullYear();
+      default: return Math.trunc(ms / 86400000);
+    }
+  }
+
+  function formatDate(date, pattern) {
+    const pad = (n, w = 2) => String(n).padStart(w, "0");
+    const map = {
+      yyyy: date.getUTCFullYear(),
+      MM: pad(date.getUTCMonth() + 1),
+      M: date.getUTCMonth() + 1,
+      dd: pad(date.getUTCDate()),
+      d: date.getUTCDate(),
+      HH: pad(date.getUTCHours()),
+      mm: pad(date.getUTCMinutes()),
+      ss: pad(date.getUTCSeconds()),
+    };
+    return String(pattern).replace(/yyyy|MM|dd|HH|mm|ss|M|d/g, (token) => map[token]);
+  }
+
+  // FORMAT用の日付パターン整形(VBA/DAX風、大文字小文字を問わず m/mm は月として扱う)
+  function formatDatePattern(date, pattern) {
+    const pad = (n, w = 2) => String(n).padStart(w, "0");
+    return String(pattern).replace(/yyyy|yy|mmmm|mmm|mm|dddd|ddd|dd|hh|ss|m|d|h|y/gi, (token) => {
+      switch (token.toLowerCase()) {
+        case "yyyy": return date.getUTCFullYear();
+        case "yy": return pad(date.getUTCFullYear() % 100);
+        case "y": return date.getUTCFullYear();
+        case "mmmm":
+        case "mmm":
+        case "mm": return pad(date.getUTCMonth() + 1);
+        case "m": return date.getUTCMonth() + 1;
+        case "dddd":
+        case "ddd":
+        case "dd": return pad(date.getUTCDate());
+        case "d": return date.getUTCDate();
+        case "hh": return pad(date.getUTCHours());
+        case "h": return date.getUTCHours();
+        case "ss": return pad(date.getUTCSeconds());
+        default: return token;
+      }
+    });
   }
 
   function roundHalf(value, decimals) {
@@ -2471,7 +2682,7 @@
   }
 
   function applyCalcFilter(rows, node, ctx) {
-    if (node.type === "call" && (node.name === "FILTER" || node.name === "ALL" || node.name === "VALUES" || node.name === "DISTINCT" || node.name === "ALLSELECTED")) {
+    if (node.type === "call" && (node.name === "FILTER" || node.name === "TOPN" || node.name === "ALL" || node.name === "VALUES" || node.name === "DISTINCT" || node.name === "ALLSELECTED")) {
       return resolveTableArg(node, { ...ctx, rows });
     }
     // ブール述語(列 = 値 など)を行フィルタとして適用
@@ -2480,6 +2691,8 @@
 
   function formatMeasureValue(value, formatString) {
     if (value == null) return "—";
+    // 日付を返すメジャーは ISO 形式で表示
+    if (value instanceof Date) return formatDate(value, "yyyy-MM-dd");
     // 文字列を返すメジャー(FORMAT連結など)はそのまま表示
     if (typeof value === "string" && !/^-?[\d,]+(\.\d+)?$/.test(value.trim())) return value;
     // 桁区切りカンマ付きの数値文字列("1,234")も数値として扱う
