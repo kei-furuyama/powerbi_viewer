@@ -53,6 +53,20 @@
               <div class="drop-icon" aria-hidden="true">PBIP</div>
               <h2>Power BI Projectを解析</h2>
               <p>`.pbip`を含むフォルダ、またはzipをここにドロップできます。</p>
+              <div class="need-files">
+                <div class="need-title">「フォルダを開く」で必要なファイル</div>
+                <p class="need-note">PBIPプロジェクトの<b>フォルダごと</b>選択してください（サブフォルダも含めて読み込みます）。最低限あると解析できる主なファイル:</p>
+                <ul class="need-list">
+                  <li><code>*.pbip</code> — プロジェクトのマニフェスト</li>
+                  <li><code>*.Report/definition.pbir</code> — レポートのデータセット参照</li>
+                  <li><code>*.Report/definition/report.json</code> / <code>pages/pages.json</code></li>
+                  <li><code>*.Report/definition/pages/&lt;page&gt;/page.json</code> — 各ページ</li>
+                  <li><code>*.Report/definition/pages/&lt;page&gt;/visuals/&lt;id&gt;/visual.json</code> — 各ビジュアル</li>
+                  <li><code>*.Report/StaticResources/**</code> — テーマJSON・画像など</li>
+                  <li><code>*.SemanticModel/definition/model.tmdl</code>・<code>tables/*.tmdl</code>（または <code>model.bim</code>）— テーブル/メジャー</li>
+                </ul>
+                <p class="need-note">数値まで再現するには、TMDLのパーティションに <code>Table.FromRows</code> でデータが埋め込まれている必要があります（外部ソース参照のみの場合は概形表示）。画像は <code>.png/.jpg/.svg</code> 等も読み込みます。読み込み後、<b>検出事項</b>タブでPBIPの整合性チェック結果を確認できます。</p>
+              </div>
             </div>
           </section>
 

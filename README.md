@@ -12,25 +12,46 @@ No uploaded file is sent to a server.
 - A zip archive containing a PBIP project
 - Individual `.pbip`, `.pbir`, `.pbism`, `.bim`, `.json`, `.tmdl`, and `.platform` files
 
-For a PBIP project that looks like this, select the parent folder with
-**フォルダを開く**:
+For a PBIP project that looks like this, select the **whole project folder**
+with **フォルダを開く** (subfolders are read recursively):
 
 ```text
 Project Folder/
+  MyReport.pbip                                  ← project manifest
   MyReport.Report/
+    definition.pbir                              ← dataset reference
+    definition/report.json
+    definition/pages/pages.json
+    definition/pages/<page>/page.json            ← each page
+    definition/pages/<page>/visuals/<id>/visual.json   ← each visual
+    StaticResources/**                           ← theme JSON, images
   MyReport.SemanticModel/
-  MyReport.pbip
+    definition.pbism
+    definition/model.tmdl
+    definition/tables/*.tmdl                      ← tables / measures
+    (or legacy model.bim)
 ```
 
-## What it can show
+## Files it reads
 
-- `.Report/definition/pages/*/page.json`
-- `.Report/definition/pages/*/visuals/*/visual.json`
-- `.Report/definition.pbir`
-- `.Report/definition/report.json`
-- `.Report/report.json`
-- `.SemanticModel/definition/**/*.tmdl`
-- Legacy `model.bim` tables when present
+| Purpose | Files |
+| --- | --- |
+| Pages & layout | `.Report/definition/pages/*/page.json` |
+| Visuals & bindings | `.Report/definition/pages/*/visuals/*/visual.json` |
+| Dataset reference | `.Report/definition.pbir` |
+| Report settings & theme | `.Report/definition/report.json`, `.Report/StaticResources/**` |
+| Tables, columns, measures | `.SemanticModel/definition/**/*.tmdl` (or legacy `model.bim`) |
+| Images (visuals / wallpaper) | `.png` `.jpg` `.jpeg` `.gif` `.svg` `.webp` `.bmp` under the project |
+| Legacy layout | `.Report/report.json` (`sections`/`visualContainers`) |
+
+To reproduce **actual numbers**, the semantic model must embed data in a TMDL
+partition via `Table.FromRows(...)`. Models that only reference an external
+source render shapes/labels without values.
+
+After loading, the **検出事項 (Issues)** tab reports a PBIP integrity check
+(broken JSON, missing files, references to non-existent tables/columns/measures,
+page-order mismatches, etc.) so you can catch projects that would fail to open
+in Power BI.
 
 ## Limitations
 
