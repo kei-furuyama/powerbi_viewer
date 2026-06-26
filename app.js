@@ -294,8 +294,22 @@
     const dataModel = buildDataModel(semantic);
     hydrateVisualData(report, dataModel);
     resolveImages(report, normalizedEntries, issues);
-    const measureUsage = computeMeasureUsage(report, semantic);
+    const measureUsage = computeModelAnalysis(report, semantic);
     const validation = validateProject(normalizedEntries, report, semantic, jsonByPath);
+
+    // 循環参照はPower BIで開けない致命的エラーなので、整合性検査に統合する(検査の終了コードに反映)
+    if (measureUsage.cycles && measureUsage.cycles.length) {
+      for (const ring of measureUsage.cycles) {
+        validation.problems.push({
+          level: "error",
+          title: "メジャーの循環参照",
+          detail: ring.join(" → ") + " → " + ring[0] + "（Power BIではエラーになります）",
+          category: "検査",
+        });
+      }
+      validation.errors = validation.problems.filter((problem) => problem.level === "error").length;
+      validation.warnings = validation.problems.filter((problem) => problem.level === "warning").length;
+    }
     const pbipFiles = normalizedEntries.filter((entry) => entry.path.toLowerCase().endsWith(".pbip"));
 
     if (!pbipFiles.length) {
@@ -361,6 +375,26 @@
         level: "warning",
         title: `未使用のメジャーが ${measureUsage.unused} 件あります`,
         detail: `${names.join(" / ")}${measureUsage.unused > names.length ? " ..." : ""}`,
+      });
+    }
+
+    if (measureUsage.lint && measureUsage.lint.length) {
+      const shown = measureUsage.lint.slice(0, 10).map((l) => `${l.measure}: ${l.message}`);
+      issues.push({
+        level: "warning",
+        title: `DAXの改善提案が ${measureUsage.lint.length} 件あります`,
+        detail: `${shown.join(" / ")}${measureUsage.lint.length > shown.length ? " ..." : ""}`,
+      });
+    }
+
+    if (measureUsage.unusedColumns > 0) {
+      const cols = semantic.tables
+        .flatMap((table) => table.columns.filter((column) => column.used === false).map((column) => `${table.name}[${column.name}]`))
+        .slice(0, 12);
+      issues.push({
+        level: "info",
+        title: `未使用の列が ${measureUsage.unusedColumns} 件あります`,
+        detail: `${cols.join(" / ")}${measureUsage.unusedColumns > cols.length ? " ..." : ""}（ビジュアル・メジャー・リレーションシップから参照されていません）`,
       });
     }
 
@@ -1531,6 +1565,7 @@
           columns: (table.columns || []).map((column) => ({
             name: column.name,
             dataType: column.dataType || column.type || "",
+            sortByColumn: column.sortByColumn || "",
           })),
           measures: (table.measures || []).map((measure) => ({
             name: measure.name,
@@ -1675,6 +1710,10 @@
 
       if (currentItem && /^formatString\s*:/i.test(line)) {
         currentItem.item.formatString = cleanLiteral(line.split(":").slice(1).join(":").trim());
+      }
+
+      if (currentItem?.type === "column" && /^sortByColumn\s*:/i.test(line)) {
+        currentItem.item.sortByColumn = cleanLiteral(line.split(":").slice(1).join(":").trim());
       }
 
       if (currentItem?.type === "measure" && !currentItem.item.expression && /^\s*=/.test(rawLine)) {
@@ -2516,51 +2555,207 @@
     }
   }
 
-  function computeMeasureUsage(report, semantic) {
-    const used = new Set();
-    const mark = (table, name) => {
-      if (!name) return;
-      used.add(normalizeName(name));
-      if (table) used.add(`${normalizeName(table)}|${normalizeName(name)}`);
-    };
+  // DAXのコメント(// , --, /* */)と文字列リテラルを空白化し、参照/演算子を安全に走査できるようにする
+  function stripDaxNoise(expr) {
+    return String(expr || "")
+      .replace(/\/\*[\s\S]*?\*\//g, " ")
+      .replace(/\/\/[^\n]*/g, " ")
+      .replace(/--[^\n]*/g, " ")
+      .replace(/"(?:[^"\\]|\\.)*"/g, '""');
+  }
 
-    // ビジュアルのロール/フィールドから参照を収集
-    for (const visual of report.visuals) {
-      for (const role of visual.roles || []) {
-        for (const field of role.fields) {
-          if (field.kind === "measure" || field.kind === "aggregation") mark(field.table, field.name);
-        }
-      }
-      for (const field of visual.fields || []) {
-        if (field.kind === "measure") mark(field.table, field.name);
-      }
+  // DAX式から [..] 参照を抽出する。{ qualified:[{table,name}], bare:[name] }
+  function extractDaxRefs(expr) {
+    const clean = stripDaxNoise(expr);
+    const qualified = [];
+    let masked = clean;
+    const qre = /(?:'([^']+)'|([A-Za-z_][\w]*))\[([^\]]+)\]/g;
+    let m;
+    while ((m = qre.exec(clean))) {
+      qualified.push({ table: m[1] || m[2], name: m[3] });
+      masked = masked.slice(0, m.index) + " ".repeat(qre.lastIndex - m.index) + masked.slice(qre.lastIndex);
     }
+    const bare = [];
+    const bre = /\[([^\]]+)\]/g;
+    while ((m = bre.exec(masked))) bare.push(m[1]);
+    return { qualified, bare };
+  }
 
-    const allNames = new Set();
-    for (const table of semantic.tables) {
-      for (const measure of table.measures) allNames.add(measure.name);
-    }
+  // メジャー依存グラフ・推移的未使用・循環参照・未使用列・DAX lint をまとめて算出
+  function computeModelAnalysis(report, semantic) {
+    const tables = semantic.tables || [];
+    const measuresList = [];
+    const measureByNorm = new Map();
+    const columnByKey = new Map();
+    const columnByNorm = new Map();
 
-    // 他メジャーのDAXから参照されるメジャーも「使用中」とみなす
-    for (const table of semantic.tables) {
+    for (const table of tables) {
       for (const measure of table.measures) {
-        const refs = String(measure.expression || "").match(/\[([^\]]+)\]/g) || [];
-        for (const ref of refs) {
-          const name = ref.slice(1, -1);
-          if (name !== measure.name && allNames.has(name)) mark(null, name);
+        measure.used = false;
+        measure.dependsOn = [];
+        measure.referencedBy = [];
+        measure.inCycle = false;
+        measure.lint = [];
+        const key = normalizeName(measure.name);
+        if (!measureByNorm.has(key)) measureByNorm.set(key, { table, measure });
+        measuresList.push({ table, measure });
+      }
+      for (const column of table.columns) {
+        column.used = false;
+        columnByKey.set(`${normalizeName(table.name)}|${normalizeName(column.name)}`, { table, column });
+        const nkey = normalizeName(column.name);
+        if (!columnByNorm.has(nkey)) columnByNorm.set(nkey, []);
+        columnByNorm.get(nkey).push({ table, column });
+      }
+    }
+
+    const measureId = (t, mm) => `${normalizeName(t.name)}|${normalizeName(mm.name)}`;
+    const measureLabel = (entry) => `${entry.table.name}[${entry.measure.name}]`;
+    const byId = new Map(measuresList.map((e) => [measureId(e.table, e.measure), e]));
+    const findMeasure = (name) => measureByNorm.get(normalizeName(name)) || null;
+    const findColumn = (tableName, colName) => {
+      if (tableName) {
+        const hit = columnByKey.get(`${normalizeName(tableName)}|${normalizeName(colName)}`);
+        if (hit) return hit;
+      }
+      const list = columnByNorm.get(normalizeName(colName));
+      return list && list.length ? list[0] : null;
+    };
+    const colKey = (entry) => `${normalizeName(entry.table.name)}|${normalizeName(entry.column.name)}`;
+
+    // メジャーの依存(他メジャー)と参照列を収集
+    const graph = new Map();              // measureId -> Set(measureId)
+    const measureColumnRefs = new Map();  // measureId -> Set(columnKey)
+    for (const entry of measuresList) {
+      const { table, measure } = entry;
+      const id = measureId(table, measure);
+      const refs = extractDaxRefs(measure.expression);
+      const deps = new Set();
+      const cols = new Set();
+      const selfNorm = normalizeName(measure.name);
+      for (const q of refs.qualified) {
+        const col = findColumn(q.table, q.name);
+        if (col) { cols.add(colKey(col)); continue; }
+        const mm = findMeasure(q.name);
+        if (mm) {
+          if (measureId(mm.table, mm.measure) !== id) deps.add(measureId(mm.table, mm.measure));
+          measure.lint.push({ rule: "qualified-measure", message: `メジャー参照 ${q.table}[${q.name}] はテーブル修飾子なし [${q.name}] が推奨です（メジャーはテーブルに属しません）。` });
         }
       }
+      for (const name of refs.bare) {
+        const mm = findMeasure(name);
+        if (mm && normalizeName(name) !== selfNorm) { deps.add(measureId(mm.table, mm.measure)); continue; }
+        if (mm && normalizeName(name) === selfNorm) continue;
+        const col = findColumn(table.name, name) || findColumn(null, name);
+        if (col) cols.add(colKey(col));
+      }
+      if (/\//.test(stripDaxNoise(measure.expression))) {
+        measure.lint.push({ rule: "division", message: "除算に `/` を使用しています。0除算・空対策に DIVIDE() の利用を検討してください。" });
+      }
+      graph.set(id, deps);
+      measureColumnRefs.set(id, cols);
+      measure.dependsOn = [...deps].map((d) => (byId.get(d) ? measureLabel(byId.get(d)) : d));
+    }
+
+    // 逆引き(referencedBy: 他メジャー)
+    for (const entry of measuresList) {
+      const id = measureId(entry.table, entry.measure);
+      for (const dep of graph.get(id) || []) {
+        const target = byId.get(dep);
+        if (target) target.measure.referencedBy.push(measureLabel(entry));
+      }
+    }
+
+    // ビジュアルが直接参照するメジャー(ルート)と列
+    const measureRoots = new Set();
+    const usedColumns = new Set();
+    const markField = (field) => {
+      if (!field) return;
+      if (field.kind === "measure") {
+        const mm = findMeasure(field.name);
+        if (mm) { measureRoots.add(measureId(mm.table, mm.measure)); return; }
+      }
+      // aggregation / column / hierarchy は列参照、measureでも列にフォールバック
+      const col = findColumn(field.table, field.name);
+      if (col) { usedColumns.add(colKey(col)); return; }
+      const mm = findMeasure(field.name);
+      if (mm) measureRoots.add(measureId(mm.table, mm.measure));
+    };
+    for (const visual of report.visuals) {
+      for (const role of visual.roles || []) for (const field of role.fields || []) markField(field);
+      for (const field of visual.fields || []) markField(field);
+    }
+
+    // 推移的に到達可能なメジャーのみ「使用中」(死んだメジャーの参照では生かさない)
+    const usedMeasures = new Set();
+    const stack = [...measureRoots];
+    while (stack.length) {
+      const id = stack.pop();
+      if (usedMeasures.has(id) || !byId.has(id)) continue;
+      usedMeasures.add(id);
+      for (const dep of graph.get(id) || []) if (!usedMeasures.has(dep)) stack.push(dep);
     }
 
     let unused = 0;
-    for (const table of semantic.tables) {
-      for (const measure of table.measures) {
-        const isUsed = used.has(`${normalizeName(table.name)}|${normalizeName(measure.name)}`) || used.has(normalizeName(measure.name));
-        measure.used = isUsed;
-        if (!isUsed) unused += 1;
+    for (const entry of measuresList) {
+      entry.measure.used = usedMeasures.has(measureId(entry.table, entry.measure));
+      if (!entry.measure.used) unused += 1;
+    }
+
+    // 循環参照(メジャー依存グラフのDFSサイクル検出)
+    const color = new Map();              // 0=未訪問,1=訪問中,2=完了
+    const pathStack = [];
+    const cycleSet = new Map();           // 正規化キー -> ラベル配列
+    const labelOf = (id) => (byId.get(id) ? measureLabel(byId.get(id)) : id);
+    const dfs = (id) => {
+      color.set(id, 1);
+      pathStack.push(id);
+      for (const dep of graph.get(id) || []) {
+        if (!byId.has(dep)) continue;
+        const c = color.get(dep) || 0;
+        if (c === 1) {
+          const start = pathStack.indexOf(dep);
+          const ring = pathStack.slice(start);
+          const key = [...ring].sort().join(">");
+          if (!cycleSet.has(key)) cycleSet.set(key, ring.map(labelOf));
+          for (const cid of ring) { const e = byId.get(cid); if (e) e.measure.inCycle = true; }
+        } else if (c === 0) {
+          dfs(dep);
+        }
+      }
+      pathStack.pop();
+      color.set(id, 2);
+    };
+    for (const id of byId.keys()) if ((color.get(id) || 0) === 0) dfs(id);
+    const cycles = [...cycleSet.values()];
+
+    // 列の使用判定: ビジュアル + 使用中メジャーのDAX + リレーションシップ
+    for (const entry of measuresList) {
+      if (!entry.measure.used) continue;
+      for (const ck of measureColumnRefs.get(measureId(entry.table, entry.measure)) || []) usedColumns.add(ck);
+    }
+    for (const rel of semantic.relationships || []) {
+      if (rel.fromTable && rel.fromColumn) usedColumns.add(`${normalizeName(rel.fromTable)}|${normalizeName(rel.fromColumn)}`);
+      if (rel.toTable && rel.toColumn) usedColumns.add(`${normalizeName(rel.toTable)}|${normalizeName(rel.toColumn)}`);
+    }
+    // 並べ替えキー(sortByColumn)として参照される列も使用中とみなす
+    for (const table of tables) {
+      for (const column of table.columns) {
+        if (!column.sortByColumn) continue;
+        const target = findColumn(table.name, column.sortByColumn);
+        if (target) usedColumns.add(colKey(target));
       }
     }
-    return { unused };
+    let unusedColumns = 0;
+    for (const table of tables) {
+      for (const column of table.columns) {
+        column.used = usedColumns.has(`${normalizeName(table.name)}|${normalizeName(column.name)}`);
+        if (!column.used) unusedColumns += 1;
+      }
+    }
+
+    const lint = measuresList.flatMap((e) => e.measure.lint.map((l) => ({ measure: measureLabel(e), ...l })));
+    return { unused, unusedColumns, cycles, lint };
   }
 
   function roleFieldsByKind(visual, kind) {
@@ -3756,10 +3951,30 @@
       (sum, table) => sum + table.measures.filter((measure) => measure.used === false).length,
       0,
     );
+    const totalUnusedCols = tables.reduce(
+      (sum, table) => sum + table.columns.filter((column) => column.used === false).length,
+      0,
+    );
+    const cycles = state.project?.measureUsage?.cycles || [];
+    const lintCount = (state.project?.measureUsage?.lint || []).length;
 
-    const summary = totalUnused
-      ? `<div class="model-summary">未使用のメジャー: <b>${totalUnused}</b> 件（ビジュアル・他メジャーから参照されていません）</div>`
-      : `<div class="model-summary">すべてのメジャーがどこかで使用されています</div>`;
+    const chips = [];
+    chips.push(totalUnused
+      ? `未使用メジャー <b>${totalUnused}</b>`
+      : `未使用メジャー <b>0</b>`);
+    chips.push(totalUnusedCols ? `未使用列 <b>${totalUnusedCols}</b>` : `未使用列 <b>0</b>`);
+    if (cycles.length) chips.push(`<span class="bad">循環参照 <b>${cycles.length}</b></span>`);
+    if (lintCount) chips.push(`DAX提案 <b>${lintCount}</b>`);
+    const cycleNote = cycles.length
+      ? `<div class="model-summary bad">循環参照: ${cycles.map((ring) => escapeHtml(ring.join(" → ") + " → " + ring[0])).join(" / ")}</div>`
+      : "";
+    const summary = `<div class="model-summary">${chips.join("　·　")}</div>` + cycleNote;
+
+    const depLine = (label, items) => {
+      if (!items || !items.length) return "";
+      const shown = items.slice(0, 8).map(escapeHtml).join(", ");
+      return `<div class="measure-deps"><span class="dep-label">${label}</span> ${shown}${items.length > 8 ? " …" : ""}</div>`;
+    };
 
     els.modelExplorer.innerHTML = renderRelationships() + summary + tables
       .map((table) => {
@@ -3767,15 +3982,22 @@
           .map((measure) => {
             const unused = measure.used === false;
             const meta = [measure.formatString].filter(Boolean).map(escapeHtml).join(" · ");
+            const lintTags = (measure.lint || [])
+              .map((l) => `<span class="tag info" title="${escapeHtml(l.message)}">${l.rule === "division" ? "DIVIDE推奨" : "修飾子"}</span>`)
+              .join("");
             return `
               <div class="measure-row ${unused ? "unused" : ""}">
                 <div class="measure-head">
                   <span class="measure-name">${escapeHtml(measure.name)}</span>
                   <span class="measure-tags">
                     ${unused ? `<span class="tag warn">未使用</span>` : ""}
+                    ${measure.inCycle ? `<span class="tag err">循環参照</span>` : ""}
+                    ${lintTags}
                     ${meta ? `<span class="field-kind">${meta}</span>` : ""}
                   </span>
                 </div>
+                ${depLine("依存:", measure.dependsOn)}
+                ${depLine("参照元:", measure.referencedBy)}
                 ${measure.expression ? `<pre class="measure-dax"><code>${escapeHtml(formatDaxDisplay(measure.expression))}</code></pre>` : ""}
               </div>
             `;
@@ -3783,11 +4005,11 @@
           .join("");
 
         const columnRows = table.columns
-          .slice(0, 30)
+          .slice(0, 60)
           .map(
             (column) => `
-              <div class="field-row">
-                <span>${escapeHtml(column.name)}</span>
+              <div class="field-row ${column.used === false ? "unused" : ""}">
+                <span>${escapeHtml(column.name)}${column.used === false ? ` <span class="tag warn">未使用</span>` : ""}</span>
                 <span class="field-kind">column${column.dataType ? ` · ${escapeHtml(column.dataType)}` : ""}</span>
               </div>
             `,
@@ -3795,12 +4017,13 @@
           .join("");
 
         const unusedCount = table.measures.filter((measure) => measure.used === false).length;
+        const unusedColCount = table.columns.filter((column) => column.used === false).length;
 
         return `
           <article class="model-table">
             <div class="model-head">
               <h3>${escapeHtml(table.name)}</h3>
-              <span class="model-count">${table.columns.length} columns / ${table.measures.length} measures${unusedCount ? ` · 未使用 ${unusedCount}` : ""}</span>
+              <span class="model-count">${table.columns.length} columns / ${table.measures.length} measures${unusedCount ? ` · 未使用M ${unusedCount}` : ""}${unusedColCount ? ` · 未使用C ${unusedColCount}` : ""}</span>
             </div>
             ${table.measures.length ? `<div class="panel-title">メジャー (DAX)</div><div class="measure-list">${measureRows}</div>` : ""}
             ${table.columns.length ? `<div class="panel-title">列</div><div class="field-list">${columnRows}</div>` : '<span class="muted">列を検出できませんでした</span>'}

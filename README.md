@@ -59,6 +59,21 @@ After loading, the **検出事項 (Issues)** tab reports a PBIP integrity check
 page-order mismatches, etc.) so you can catch projects that would fail to open
 in Power BI.
 
+The **モデル (Model)** tab adds static analysis of the semantic model:
+
+- **Unused measures / columns** — anything not reached (transitively) from a
+  visual, another used measure, a relationship, or a `sortByColumn`.
+- **Measure dependency graph** — each measure lists what it 依存 (depends on)
+  and its 参照元 (reverse references).
+- **Circular references** — measure cycles (e.g. `A → B → A`) are detected and
+  reported as errors, since Power BI refuses to open them.
+- **DAX hints** — e.g. suggesting `DIVIDE()` over `/`, or dropping a table
+  qualifier on a measure reference.
+
+This is also exposed through the CLI/MCP `analyze` output (`measureUsage` plus
+per-measure `used` / `dependsOn` / `referencedBy` / `inCycle`), and circular
+references make `pbip-viewer check` exit non-zero.
+
 ## Command line (CLI)
 
 The same analyzer that powers the browser app runs in Node (v18+), so you can

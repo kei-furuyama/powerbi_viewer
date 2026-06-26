@@ -1546,6 +1546,44 @@ td code,
   background: rgba(214, 114, 22, 0.1);
 }
 
+.tag.err {
+  border-color: var(--danger);
+  color: var(--danger);
+  background: rgba(179, 38, 30, 0.1);
+}
+
+.tag.info {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: rgba(0, 124, 114, 0.1);
+}
+
+.measure-deps {
+  margin-top: 5px;
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+
+.measure-deps .dep-label {
+  font-weight: 600;
+  color: var(--accent-strong);
+  margin-right: 4px;
+}
+
+.model-summary.bad {
+  border-color: var(--danger);
+  color: var(--danger);
+  background: rgba(179, 38, 30, 0.07);
+}
+
+.model-summary .bad {
+  color: var(--danger);
+}
+
+.field-row.unused span:first-child {
+  color: var(--muted);
+}
+
 .measure-dax {
   margin: 7px 0 0;
   padding: 8px;

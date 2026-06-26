@@ -928,3 +928,78 @@ assert.equal(legacyProject.semantic.tables.length, 1);
 assert.equal(legacyProject.semantic.tables[0].name, "Status");
 
 console.log("legacy parser smoke test passed");
+
+// --- model static analysis: transitive unused, cycle, division lint, unused columns ---
+const modelTmdl = [
+  "table T",
+  "\tcolumn k",
+  "\t\tdataType: string",
+  "\tcolumn v",
+  "\t\tdataType: int64",
+  "\tcolumn 未使用列",
+  "\t\tdataType: int64",
+  "\tmeasure Base = SUM('T'[v])",            // used by a visual (root)
+  "\tmeasure Helper = [Base] * 2",           // used transitively via Base->Helper? no: Visual uses Ratio
+  "\tmeasure Ratio = [Helper] / [Base]",     // root (bound to card); division lint
+  "\tmeasure DeadA = [DeadB] + 1",           // dead cycle
+  "\tmeasure DeadB = [DeadA] + 1",           // dead cycle
+  "\tmeasure Orphan = [Base] + 1",           // referenced by nobody, references Base (Base still used via Ratio)
+  "\tpartition T = m",
+  "\t\tsource =",
+  "\t\t\tlet Source = Table.FromRows({ {\"A\",10},{\"B\",20} }, type table [k=text, v=Int64.Type]) in Source",
+].join("\n");
+
+const modelProject = analyzeProject(
+  [
+    {
+      path: "MA.Report/definition/pages/p/visuals/v/visual.json",
+      text: JSON.stringify({
+        name: "v",
+        position: { x: 0, y: 0, width: 200, height: 120, z: 0 },
+        visual: {
+          visualType: "card",
+          query: { queryState: { Values: { projections: [{ field: { Measure: { Property: "Ratio" } }, queryRef: "Ratio" }] } } },
+        },
+      }),
+      size: 200,
+    },
+    { path: "MA.Report/definition/pages/p/page.json", text: JSON.stringify({ name: "p", displayName: "P", width: 1280, height: 720 }), size: 80 },
+    { path: "MA.Report/definition/pages/pages.json", text: JSON.stringify({ pageOrder: ["p"], activePageName: "p" }), size: 60 },
+    { path: "MA.SemanticModel/definition/tables/T.tmdl", text: modelTmdl, size: 400 },
+  ],
+  [],
+);
+
+const mUsage = modelProject.measureUsage;
+const mByName = {};
+for (const t of modelProject.semantic.tables) for (const m of t.measures) mByName[m.name] = m;
+
+// transitive usage: Ratio (root) -> Helper -> Base are used; Orphan/DeadA/DeadB are unused
+assert.equal(mByName["Ratio"].used, true, "Ratio is the visual root");
+assert.equal(mByName["Helper"].used, true, "Helper is used transitively by Ratio");
+assert.equal(mByName["Base"].used, true, "Base is used transitively");
+assert.equal(mByName["Orphan"].used, false, "Orphan is unused (referenced by nobody)");
+assert.equal(mByName["DeadA"].used, false, "DeadA is unused (dead cycle)");
+assert.equal(mByName["DeadB"].used, false, "DeadB is unused (dead cycle)");
+
+// dependency graph + reverse index
+assert.ok(mByName["Ratio"].dependsOn.some((d) => /Helper/.test(d)), "Ratio dependsOn Helper");
+assert.ok(mByName["Base"].referencedBy.some((d) => /Helper/.test(d)), "Base referencedBy Helper");
+
+// cycle detection
+assert.ok(mUsage.cycles.length >= 1, "a measure cycle is detected");
+assert.equal(mByName["DeadA"].inCycle, true, "DeadA flagged inCycle");
+assert.equal(mByName["DeadB"].inCycle, true, "DeadB flagged inCycle");
+
+// DAX lint: Ratio uses '/'
+assert.ok(mUsage.lint.some((l) => /Ratio/.test(l.measure) && l.rule === "division"), "division lint on Ratio");
+
+// unused columns: 未使用列 is referenced nowhere; k/v are used (v by Base, k... not referenced -> unused)
+assert.equal(mByName ? mByName["Base"].used : true, true);
+const colsByName = {};
+for (const c of modelProject.semantic.tables[0].columns) colsByName[c.name] = c;
+assert.equal(colsByName["v"].used, true, "column v is used by Base measure");
+assert.equal(colsByName["未使用列"].used, false, "未使用列 is unused");
+assert.ok(mUsage.unusedColumns >= 1, "unused columns counted");
+
+console.log("model static analysis smoke test passed");
