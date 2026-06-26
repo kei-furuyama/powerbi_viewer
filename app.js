@@ -2818,8 +2818,9 @@
         }
       }
 
-      // 並べ替え(棒/列は合計降順、折れ線は出現順)＋上限
-      if (!isLine) {
+      // 並べ替え(棒/列は合計降順、折れ線/ウォーターフォールは出現順)＋上限
+      const keepOrder = isLine || type.includes("waterfall");
+      if (!keepOrder) {
         const order = categoriesList
           .map((label, index) => ({ index, total: seriesList.reduce((sum, s) => sum + Math.abs(s.values[index]), 0) }))
           .sort((a, b) => b.total - a.total)
@@ -3189,6 +3190,10 @@
       return renderFunnel(data, theme, visual.style?.dataLabels?.show !== false);
     }
 
+    if (type.includes("waterfall") && data?.kind === "category" && data.series.length) {
+      return wrapWithChartLegend(visual, data, theme, renderWaterfall(data, visual.style?.dataLabels?.show !== false));
+    }
+
     if (type.includes("bar") || type.includes("column") || type.includes("histogram") || type.includes("funnel") || type.includes("waterfall") || type.includes("ribbon")) {
       const horizontal = type.includes("bar") && !type.includes("column");
       if (data?.kind === "category" && data.seriesList?.length) {
@@ -3429,6 +3434,38 @@
       })
       .join("");
     return `<div class="mini-treemap labeled">${tiles}</div>`;
+  }
+
+  // ウォーターフォール: 累計の浮動バー(増=緑/減=赤)
+  function renderWaterfall(data, showLabels) {
+    const UP = "#1AAB40";
+    const DOWN = "#D64550";
+    const points = data.series.slice(0, 16);
+    let cum = 0;
+    const steps = points.map((p) => {
+      const start = cum;
+      cum += Number(p.value) || 0;
+      return { label: p.label, value: Number(p.value) || 0, start, end: cum };
+    });
+    const lo = Math.min(0, ...steps.map((s) => Math.min(s.start, s.end)));
+    const hi = Math.max(0, ...steps.map((s) => Math.max(s.start, s.end)));
+    const range = hi - lo || 1;
+    const bars = steps
+      .map((s) => {
+        const upper = Math.max(s.start, s.end);
+        const lower = Math.min(s.start, s.end);
+        const top = ((hi - upper) / range) * 100;
+        const height = (Math.abs(s.end - s.start) / range) * 100;
+        const color = s.value >= 0 ? UP : DOWN;
+        const valueText = formatMeasureValue(s.value, data.format);
+        return `<div class="wf-col" title="${escapeAttribute(`${s.label}: ${valueText}`)}">
+          <span class="wf-bar" style="top:${top.toFixed(1)}%;height:${Math.max(1, height).toFixed(1)}%;background:${color}"></span>
+          ${showLabels ? `<span class="wf-value" style="top:${Math.max(0, top - 7).toFixed(1)}%">${escapeHtml(valueText)}</span>` : ""}
+          <span class="wf-label">${escapeHtml(s.label)}</span>
+        </div>`;
+      })
+      .join("");
+    return `<div class="mini-wf">${bars}</div>`;
   }
 
   function renderFunnel(data, theme, showLabels) {

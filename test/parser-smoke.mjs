@@ -784,6 +784,32 @@ assert.equal(sh.style.line.weight, 4, "shape line weight");
 
 console.log("continue fixes smoke test passed");
 
+// --- ウォーターフォール: 元の順序を維持(降順ソートしない) ---
+const wfTmdl = [
+  "table T",
+  "\tmeasure 増減 = SUM('T'[d])",
+  "\tcolumn k", "\t\tdataType: string",
+  "\tcolumn o", "\t\tdataType: int64",
+  "\tcolumn d", "\t\tdataType: int64",
+  "\tpartition T = m", "\t\tsource =",
+  "\t\t\tlet Source = Table.FromRows({ {\"開始\",1,100},{\"四\",2,40},{\"五\",3,-30} }, type table [k=text, o=Int64.Type, d=Int64.Type]) in Source",
+].join("\n");
+const wfProject = analyzeProject(
+  [
+    { path: "WF.pbip", text: JSON.stringify({ version: "1.0", artifacts: [{ report: { path: "WF.Report" } }] }), size: 40 },
+    { path: "WF.Report/definition/pages/pages.json", text: JSON.stringify({ pageOrder: ["P"] }), size: 30 },
+    { path: "WF.Report/definition/pages/P/page.json", text: JSON.stringify({ name: "P", displayName: "P", width: 1280, height: 720 }), size: 60 },
+    { path: "WF.Report/definition/pages/P/visuals/wf/visual.json", text: JSON.stringify({ name: "wf", position: { x: 0, y: 0, width: 400, height: 240, z: 0 }, visual: { visualType: "waterfallChart", query: { queryState: { Category: { projections: [{ field: { Column: { Expression: { SourceRef: { Entity: "T" } }, Property: "k" } }, queryRef: "T.k", nativeQueryRef: "k" }] }, Y: { projections: [{ field: { Measure: { Expression: { SourceRef: { Entity: "T" } }, Property: "増減" } }, queryRef: "T.増減", nativeQueryRef: "増減" }] } } } } }), size: 200 },
+    { path: "WF.SemanticModel/definition/tables/T.tmdl", text: wfTmdl, size: 300 },
+  ],
+  [],
+);
+const wf = wfProject.report.pages[0].visuals[0].data;
+assert.deepEqual(wf.categories, ["開始", "四", "五"], "waterfall keeps original order (not value-sorted)");
+assert.deepEqual(wf.series.map((p) => p.value), [100, 40, -30], "waterfall values incl. negative");
+
+console.log("waterfall smoke test passed");
+
 const legacyReportConfig = {
   name: "legacy_donut",
   layouts: [

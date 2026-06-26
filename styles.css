@@ -722,6 +722,51 @@ select {
   opacity: 0.9;
 }
 
+.mini-wf {
+  display: flex;
+  align-items: stretch;
+  gap: 4%;
+  height: 100%;
+  min-height: 0;
+  align-self: stretch;
+}
+
+.wf-col {
+  flex: 1;
+  min-width: 0;
+  position: relative;
+}
+
+.wf-bar {
+  position: absolute;
+  left: 12%;
+  right: 12%;
+  border-radius: 2px;
+  min-height: 1px;
+}
+
+.wf-value {
+  position: absolute;
+  left: 0;
+  right: 0;
+  text-align: center;
+  font-size: 0.52rem;
+  color: var(--ink, #2a2a2a);
+}
+
+.wf-label {
+  position: absolute;
+  bottom: -2px;
+  left: 0;
+  right: 0;
+  text-align: center;
+  font-size: 0.52rem;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .mini-funnel {
   display: flex;
   flex-direction: column;
