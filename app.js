@@ -304,6 +304,10 @@
     return result;
   }
 
+  // ===================================================================
+  // 解析パイプライン: entries → report/semantic/dataModel/検査/静的解析
+  // (完全にDOM非依存。CLI/MCPもこの関数を import して使う)
+  // ===================================================================
   function analyzeProject(entries, incomingIssues = []) {
     const normalizedEntries = dedupeEntries(entries).map((entry) => ({
       ...entry,
@@ -1621,6 +1625,10 @@
     }
   }
 
+  // ===================================================================
+  // セマンティックモデル解析(TMDL / model.bim → tables/columns/measures/
+  // relationships/roles/calculationGroups/refreshPolicies)
+  // ===================================================================
   function buildSemantic(entries, jsonByPath) {
     const semantic = emptySemantic();
     const semanticRoots = unique(entries.map((entry) => getTaggedRoot(entry.path, ".SemanticModel")).filter(Boolean));
@@ -2137,9 +2145,13 @@
 
   function resolveColumn(table, name) {
     if (!table) return null;
-    const target = normalizeName(name);
-    const column = table.columns.find((item) => normalizeName(item.name) === target);
-    return column ? column.name : null;
+    // 正規化名→実列名のマップをテーブルに一度だけ構築(行ごとの線形探索を回避)
+    if (!table.__colMap) {
+      const map = new Map();
+      for (const item of table.columns) map.set(normalizeName(item.name), item.name);
+      Object.defineProperty(table, "__colMap", { value: map, enumerable: false });
+    }
+    return table.__colMap.get(normalizeName(name)) || null;
   }
 
   function aggregate(records, columnName, func) {
@@ -2322,14 +2334,30 @@
     }
   }
 
+  // コンパイル済みDAX(VAR分解 + トークナイズ + パース)を式文字列でキャッシュ。
+  // ASTは評価中に変更しないため再利用可能。メジャーは(カテゴリ×ビジュアル)で多数回評価されるため効く。
+  const __daxCache = new Map();
+  function compileDax(expression) {
+    let compiled = __daxCache.get(expression);
+    if (!compiled) {
+      const { vars, body } = stripVars(expression);
+      compiled = {
+        vars: vars.map((v) => ({ name: v.name, ast: parseDax(tokenizeDax(v.expr)) })),
+        bodyAst: parseDax(tokenizeDax(body)),
+      };
+      __daxCache.set(expression, compiled);
+    }
+    return compiled;
+  }
+
   function evaluateMeasureExpression(expression, ctx) {
-    const { vars, body } = stripVars(expression);
+    const { vars, bodyAst } = compileDax(expression);
     const scope = { ...ctx.vars };
     const localCtx = { ...ctx, vars: scope };
     for (const variable of vars) {
-      scope[variable.name] = evalDaxNode(parseDax(tokenizeDax(variable.expr)), localCtx);
+      scope[variable.name] = evalDaxNode(variable.ast, localCtx);
     }
-    return evalDaxNode(parseDax(tokenizeDax(body)), localCtx);
+    return evalDaxNode(bodyAst, localCtx);
   }
 
   function toNum(value) {
@@ -3454,6 +3482,10 @@
     return String(value || "").trim().replace(/^[\['"]+/, "").replace(/[\]'"]+$/, "").toLowerCase();
   }
 
+  // ===================================================================
+  // モデル静的解析(依存グラフ・推移的未使用・Tarjan循環検出・DAX lint)と
+  // ベストプラクティス検査(computeBestPractices)
+  // ===================================================================
   function computeModelAnalysis(report, semantic) {
     const tables = semantic.tables || [];
     const measuresList = [];
@@ -3795,6 +3827,9 @@
     return Boolean(xf && normalizeName(xf.table) === normalizeName(tableName) && normalizeName(xf.column) === normalizeName(column) && String(xf.value) === String(value));
   }
 
+  // ===================================================================
+  // ビジュアルデータ計算(各ビジュアル種別→描画用データ。クロスフィルタ適用)
+  // ===================================================================
   function computeVisualData(visual, dataModel) {
     const categories = roleFieldsByKind(visual, "category");
     const values = roleFieldsByKind(visual, "value");
@@ -4141,6 +4176,10 @@
     return String(value);
   }
 
+  // ===================================================================
+  // レンダリング(DOM依存。typeof document !== "undefined" のときのみ動作)
+  // render → タブ/概要/ページ/キャンバス/各ビジュアル/インスペクタ/モデル
+  // ===================================================================
   function render() {
     renderTabs();
     renderMetrics();
@@ -5664,6 +5703,9 @@
       .trim();
   }
 
+  // ===================================================================
+  // ユーティリティ(エスケープ・色変換・整形・パス/ファイル判定 など)
+  // ===================================================================
   function escapeHtml(value) {
     return String(value ?? "")
       .replace(/&/g, "&amp;")
