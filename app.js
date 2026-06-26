@@ -812,7 +812,27 @@
         show: labelsProps ? readExprBool(labelsProps.show) !== false : null,
       },
       card: extractCardStyle(objects),
+      table: extractTableStyle(objects),
       dataColors: extractDataColors(objects),
+    };
+  }
+
+  function extractTableStyle(objects) {
+    const header = firstObjectProps(objects.columnHeaders);
+    const vals = firstObjectProps(objects.values);
+    const tot = firstObjectProps(objects.total) || firstObjectProps(objects.subTotals);
+    return {
+      headerColor: readExprColor(header?.fontColor),
+      headerBack: readExprColor(header?.backColor),
+      headerBold: readExprBool(header?.bold) === true,
+      fontColor: readExprColor(vals?.fontColorPrimary) || readExprColor(vals?.fontColor),
+      bandPrimary: readExprColor(vals?.backColorPrimary),
+      bandSecondary: readExprColor(vals?.backColorSecondary),
+      total: {
+        show: tot ? readExprBool(tot?.show) === true : false,
+        color: readExprColor(tot?.fontColor),
+        back: readExprColor(tot?.backColor),
+      },
     };
   }
 
@@ -2370,11 +2390,13 @@
 
     // テーブル / マトリックス
     if (type.includes("table") || type.includes("pivot") || type.includes("matrix")) {
-      const columnFields = [...categories, ...values.filter((field) => field.kind !== "measure"), ...values.filter((field) => field.kind === "measure")];
-      const plain = columnFields.filter((field) => field.kind !== "measure");
+      const plain = [...categories, ...values].filter((field) => field.kind !== "measure");
       const columnNames = plain.map((field) => resolveColumn(table, field.name) || field.name);
       const rows = records.slice(0, 8).map((record) => columnNames.map((name) => formatCell(record[name])));
-      return { kind: "table", columns: plain.map((field) => field.display), rows, total: records.length };
+      // 数値列は合計を算出(合計行表示用)
+      const numericCol = columnNames.map((name) => records.some((r) => r[name] != null && r[name] !== "") && records.every((r) => r[name] == null || r[name] === "" || Number.isFinite(Number(r[name]))));
+      const totals = columnNames.map((name, i) => (numericCol[i] ? groupThousands(roundTo(records.reduce((s, r) => s + (Number(r[name]) || 0), 0), 2)) : ""));
+      return { kind: "table", columns: plain.map((field) => field.display), rows, totals, hasNumeric: numericCol.some(Boolean), total: records.length };
     }
 
     // スライサー
@@ -2833,11 +2855,26 @@
     if (type.includes("table") || type.includes("pivot") || type.includes("matrix")) {
       const columns = data?.kind === "table" ? data.columns : [...categories, ...values].map((field) => field.display);
       if (columns.length) {
-        const head = columns.slice(0, 5).map((name) => `<th>${escapeHtml(name)}</th>`).join("");
+        const ts = visual.style?.table || {};
+        const maxCols = 6;
+        const headStyle = [
+          ts.headerColor ? `color:${escapeAttribute(ts.headerColor)}` : "",
+          ts.headerBack ? `background:${escapeAttribute(ts.headerBack)}` : "",
+          ts.headerBold ? "font-weight:700" : "",
+        ].filter(Boolean).join(";");
+        const bodyStyle = ts.fontColor ? `color:${escapeAttribute(ts.fontColor)}` : "";
+        const head = columns.slice(0, maxCols).map((name) => `<th style="${headStyle}">${escapeHtml(name)}</th>`).join("");
+        const banded = ts.bandPrimary || ts.bandSecondary;
         const rows = data?.kind === "table" && data.rows.length
-          ? data.rows.slice(0, 5).map((row) => `<tr>${row.slice(0, 5).map((cell) => `<td>${escapeHtml(String(cell))}</td>`).join("")}</tr>`).join("")
-          : Array.from({ length: 4 }, () => `<tr>${columns.slice(0, 5).map(() => "<td>—</td>").join("")}</tr>`).join("");
-        return `<table class="mini-grid"><thead><tr>${head}</tr></thead><tbody>${rows}</tbody></table>`;
+          ? data.rows.slice(0, 6).map((row, ri) => {
+              const band = banded ? `background:${escapeAttribute((ri % 2 ? ts.bandSecondary : ts.bandPrimary) || "")}` : "";
+              return `<tr style="${band}">${row.slice(0, maxCols).map((cell) => `<td style="${bodyStyle}">${escapeHtml(String(cell))}</td>`).join("")}</tr>`;
+            }).join("")
+          : Array.from({ length: 4 }, () => `<tr>${columns.slice(0, maxCols).map(() => "<td>—</td>").join("")}</tr>`).join("");
+        const totalRow = data?.kind === "table" && ts.total?.show && data.hasNumeric
+          ? `<tr class="total-row" style="${[ts.total.color ? `color:${escapeAttribute(ts.total.color)}` : "", ts.total.back ? `background:${escapeAttribute(ts.total.back)}` : ""].filter(Boolean).join(";")}">${data.totals.slice(0, maxCols).map((t, i) => `<td>${i === 0 && !t ? "合計" : escapeHtml(String(t))}</td>`).join("")}</tr>`
+          : "";
+        return `<table class="mini-grid"><thead><tr>${head}</tr></thead><tbody>${rows}${totalRow}</tbody></table>`;
       }
     }
 

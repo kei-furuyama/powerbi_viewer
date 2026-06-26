@@ -999,6 +999,11 @@ select {
   font-weight: 600;
 }
 
+.mini-grid .total-row td {
+  font-weight: 700;
+  border-top: 1.5px solid var(--line-strong);
+}
+
 .mini-slicer-head {
   font-weight: 600;
   color: var(--ink, #2a2a2a) !important;

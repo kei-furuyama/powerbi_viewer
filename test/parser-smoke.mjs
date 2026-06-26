@@ -541,6 +541,46 @@ assert.deepEqual(stack.data.seriesList.map((s) => s.name).sort(), ["X", "Y"], "s
 
 console.log("multi-series smoke test passed");
 
+// --- テーブル書式・合計(C) ---
+const tableProject = analyzeProject(
+  [
+    { path: "TB.pbip", text: JSON.stringify({ version: "1.0", artifacts: [{ report: { path: "TB.Report" } }] }), size: 40 },
+    { path: "TB.Report/definition/pages/pages.json", text: JSON.stringify({ pageOrder: ["P"] }), size: 30 },
+    { path: "TB.Report/definition/pages/P/page.json", text: JSON.stringify({ name: "P", displayName: "P", width: 1280, height: 720 }), size: 60 },
+    {
+      path: "TB.Report/definition/pages/P/visuals/t/visual.json",
+      text: JSON.stringify({
+        name: "t",
+        position: { x: 0, y: 0, width: 500, height: 300, z: 0 },
+        visual: {
+          visualType: "tableEx",
+          objects: {
+            columnHeaders: [{ properties: { fontColor: { solid: { color: { expr: { Literal: { Value: "'#FFFFFF'" } } } } }, backColor: { solid: { color: { expr: { Literal: { Value: "'#1F5FA6'" } } } } }, bold: { expr: { Literal: { Value: "true" } } } } }],
+            values: [{ properties: { fontColorPrimary: { solid: { color: { expr: { Literal: { Value: "'#252423'" } } } } } } }],
+            total: [{ properties: { show: { expr: { Literal: { Value: "true" } } } } }],
+          },
+          query: { queryState: { Values: { projections: [
+            { field: { Column: { Expression: { SourceRef: { Entity: "T" } }, Property: "k" } }, queryRef: "T.k", nativeQueryRef: "k" },
+            { field: { Column: { Expression: { SourceRef: { Entity: "T" } }, Property: "v" } }, queryRef: "T.v", nativeQueryRef: "v" },
+          ] } } },
+        },
+      }),
+      size: 300,
+    },
+    { path: "TB.SemanticModel/definition/tables/T.tmdl", text: ["table T", "\tcolumn k", "\t\tdataType: string", "\tcolumn v", "\t\tdataType: int64", "\tpartition T = m", "\t\tsource =", "\t\t\tlet Source = Table.FromRows({ {\"A\",10},{\"B\",20},{\"C\",30} }, type table [k=text, v=Int64.Type]) in Source"].join("\n"), size: 200 },
+  ],
+  [],
+);
+const tv = tableProject.report.pages[0].visuals.find((v) => v.id === "t");
+assert.equal(tv.style.table.headerBack, "#1F5FA6", "header back color");
+assert.equal(tv.style.table.headerColor, "#FFFFFF", "header font color");
+assert.equal(tv.style.table.total.show, true, "total enabled");
+assert.equal(tv.data.kind, "table");
+assert.equal(tv.data.hasNumeric, true, "numeric column detected");
+assert.equal(tv.data.totals[1], "60", "sum of v column (10+20+30)");
+
+console.log("table format smoke test passed");
+
 const legacyReportConfig = {
   name: "legacy_donut",
   layouts: [
