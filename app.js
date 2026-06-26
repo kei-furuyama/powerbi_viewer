@@ -8,6 +8,7 @@
     selectedPageId: null,
     selectedVisualId: null,
     crossFilter: null, // { table, column, value, visualId } — クロスフィルタ選択
+    modelUnusedOnly: false, // モデルタブ: 未使用のみ表示
   };
 
   const els = {};
@@ -5313,6 +5314,11 @@
     if (calcGroups.length) chips.push(`計算グループ <b>${calcGroups.length}</b>`);
     if (refresh.length) chips.push(`更新ポリシー <b>${refresh.length}</b>`);
 
+    // テーブルのパスから所属セマンティックモデルを推定
+    const modelLabelOf = (table) => (String(table.path || "").split("/").find((seg) => /\.SemanticModel$/i.test(seg)) || "");
+    const modelLabels = [...new Set(tables.map(modelLabelOf).filter(Boolean))];
+    if (modelLabels.length > 1) chips.push(`セマンティックモデル <b>${modelLabels.length}</b>`);
+
     const cycleNote = cycles.length
       ? `<div class="model-summary bad">循環参照: ${cycles.map((ring) => escapeHtml(ring.join(" → ") + " → " + ring[0])).join(" / ")}</div>`
       : "";
@@ -5332,9 +5338,15 @@
       return `<div class="measure-deps"><span class="dep-label">${label}</span> ${shown}${items.length > 8 ? " …" : ""}</div>`;
     };
 
-    els.modelExplorer.innerHTML = renderRelationships() + summary + tables
-      .map((table) => {
-        const measureRows = table.measures
+    const unusedOnly = state.modelUnusedOnly;
+    const toggle = `<div class="model-toolbar"><button type="button" class="model-toggle ${unusedOnly ? "on" : ""}">${unusedOnly ? "☑" : "☐"} 未使用のみ表示</button></div>`;
+
+    const renderTableArticle = (table) => {
+        // 未使用のみ表示のときは未使用のメジャー/列だけに絞る(無ければテーブルごと省略)
+        const showMeasures = unusedOnly ? table.measures.filter((m) => m.used === false) : table.measures;
+        const showColumns = unusedOnly ? table.columns.filter((c) => c.used === false) : table.columns;
+        if (unusedOnly && !showMeasures.length && !showColumns.length) return "";
+        const measureRows = showMeasures
           .map((measure) => {
             const unused = measure.used === false;
             const meta = [measure.formatString].filter(Boolean).map(escapeHtml).join(" · ");
@@ -5360,7 +5372,7 @@
           })
           .join("");
 
-        const columnRows = table.columns
+        const columnRows = showColumns
           .slice(0, 60)
           .map(
             (column) => `
@@ -5379,14 +5391,39 @@
           <article class="model-table">
             <div class="model-head">
               <h3>${escapeHtml(table.name)}</h3>
-              <span class="model-count">${table.columns.length} columns / ${table.measures.length} measures${unusedCount ? ` · 未使用M ${unusedCount}` : ""}${unusedColCount ? ` · 未使用C ${unusedColCount}` : ""}</span>
+              <span class="model-count">${table.columns.length} columns / ${table.measures.length} measures${unusedCount ? ` · <span class="count-warn">未使用M ${unusedCount}</span>` : ""}${unusedColCount ? ` · <span class="count-warn">未使用C ${unusedColCount}</span>` : ""}</span>
             </div>
-            ${table.measures.length ? `<div class="panel-title">メジャー (DAX)</div><div class="measure-list">${measureRows}</div>` : ""}
-            ${table.columns.length ? `<div class="panel-title">列</div><div class="field-list">${columnRows}</div>` : '<span class="muted">列を検出できませんでした</span>'}
+            ${showMeasures.length ? `<div class="panel-title">メジャー (DAX)</div><div class="measure-list">${measureRows}</div>` : ""}
+            ${showColumns.length ? `<div class="panel-title">列</div><div class="field-list">${columnRows}</div>` : (table.columns.length ? "" : '<span class="muted">列を検出できませんでした</span>')}
           </article>
         `;
-      })
-      .join("");
+    };
+
+    // セマンティックモデルごとにグループ化(複数モデルのときだけ見出しを付ける)
+    const groups = new Map();
+    const groupOrder = [];
+    for (const table of tables) {
+      const html = renderTableArticle(table);
+      if (!html) continue;
+      const label = modelLabelOf(table) || "(モデル)";
+      if (!groups.has(label)) { groups.set(label, []); groupOrder.push(label); }
+      groups.get(label).push(html);
+    }
+    let body;
+    if (!groupOrder.length) {
+      body = `<div class="empty-table">未使用のメジャー・列はありません 🎉</div>`;
+    } else if (groupOrder.length <= 1) {
+      body = groups.get(groupOrder[0]).join("");
+    } else {
+      body = groupOrder.map((label) => {
+        const arts = groups.get(label);
+        return `<div class="model-group-head">📦 ${escapeHtml(label)} <span class="model-group-count">${arts.length} テーブル</span></div>${arts.join("")}`;
+      }).join("");
+    }
+
+    els.modelExplorer.innerHTML = renderRelationships() + summary + toggle + body;
+    const toggleBtn = els.modelExplorer.querySelector(".model-toggle");
+    if (toggleBtn) toggleBtn.addEventListener("click", () => { state.modelUnusedOnly = !state.modelUnusedOnly; renderModelExplorer(); });
   }
 
   function renderRelationships() {

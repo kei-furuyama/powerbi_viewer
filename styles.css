@@ -1673,7 +1673,12 @@ td code,
 
 .measure-row.unused {
   border-color: var(--amber);
-  background: rgba(214, 114, 22, 0.06);
+  background: rgba(214, 114, 22, 0.08);
+  border-left: 3px solid var(--amber);
+}
+
+.measure-row.unused .measure-name {
+  color: var(--amber);
 }
 
 .measure-head {
@@ -1747,8 +1752,60 @@ td code,
   color: var(--danger);
 }
 
+.field-row.unused {
+  border-left: 3px solid var(--amber);
+  padding-left: 6px;
+  background: rgba(214, 114, 22, 0.06);
+  border-radius: 3px;
+}
+
 .field-row.unused span:first-child {
+  color: var(--amber);
+  font-weight: 600;
+}
+
+/* モデルタブ: 未使用フィルタ・セマンティックモデル見出し */
+.model-toolbar {
+  grid-column: 1 / -1;
+  margin: 2px 0 4px;
+}
+
+.model-toggle {
+  font-size: 0.8rem;
+  padding: 4px 11px;
+  border-radius: 999px;
+  border: 1px solid var(--line-strong);
+  background: var(--surface);
   color: var(--muted);
+  cursor: pointer;
+}
+
+.model-toggle.on {
+  border-color: var(--amber);
+  color: var(--amber);
+  background: rgba(214, 114, 22, 0.1);
+  font-weight: 600;
+}
+
+.model-group-head {
+  grid-column: 1 / -1;
+  margin: 16px 0 2px;
+  padding: 6px 4px 5px;
+  font-weight: 700;
+  color: var(--accent-strong);
+  border-bottom: 2px solid var(--accent);
+}
+
+.model-group-count {
+  font-weight: 400;
+  font-size: 0.8rem;
+  color: var(--muted);
+  margin-left: 6px;
+}
+
+.count-warn {
+  color: var(--amber);
+  font-weight: 600;
 }
 
 .measure-dax {
