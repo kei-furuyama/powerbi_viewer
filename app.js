@@ -906,6 +906,11 @@
       const resolved = fieldFromExpression(inner, aliasMap);
       table = cleanFieldName(resolved.table || "");
       name = cleanFieldName(resolved.name || "");
+      // 別名が未解決(From句なし)なら queryRef の先頭で実テーブル名を補正
+      if (!resolved.tableResolved && projection.queryRef) {
+        const qp = String(projection.queryRef).split(".");
+        if (qp.length >= 2) table = cleanFieldName(qp[0]);
+      }
     }
 
     if (!name && projection.nativeQueryRef) name = cleanFieldName(projection.nativeQueryRef);
@@ -1617,6 +1622,8 @@
         expression.Name ||
         findFirstScalar(expression, ["Property"]) ||
         findFirstScalar(expression, ["Name"]),
+      // Entity は実テーブル名、Source は別名(aliasMapで解決できれば真)
+      tableResolved: Boolean(expressionRoot.SourceRef?.Entity) || aliasMap.has(String(rawTable)),
     };
   }
 
@@ -3444,7 +3451,12 @@
     const brokenPageDirs = new Set();
     for (const entry of entries) {
       const m = entry.path.match(/\/pages\/([^/]+)\/page\.json$/i);
-      if (m && entry.jsonError) brokenPageDirs.add(m[1]);
+      if (m && entry.jsonError) {
+        brokenPageDirs.add(m[1]); // ディレクトリ名
+        // 壊れていてもraw textから name を回収して二重計上を防ぐ
+        const nm = /"name"\s*:\s*"([^"]+)"/.exec(entry.text || "");
+        if (nm) brokenPageDirs.add(nm[1]);
+      }
     }
 
     const order = Array.isArray(report.pagesJson?.pageOrder) ? report.pagesJson.pageOrder.map(String) : [];
@@ -4944,10 +4956,11 @@
   function renderCombo(data, theme) {
     const barSeries = data.seriesList.filter((s) => s.mode !== "line");
     const lineSeries = data.seriesList.filter((s) => s.mode === "line");
-    const useBars = barSeries.length ? barSeries : data.seriesList;
+    // 棒系列が無ければ折れ線だけを描く(全系列を棒として二重描画しない)
+    const useBars = barSeries;
     const barMax = Math.max(1, ...useBars.flatMap((s) => s.values.map((v) => Math.abs(v))));
     const barData = { ...data, seriesList: useBars, multi: useBars.length > 1, max: barMax };
-    const bars = useBars.length > 1 ? renderMultiBars(barData, theme, false, false) : renderDataBars({ ...barData, series: data.categories.map((label, i) => ({ label, value: useBars[0].values[i], format: data.format })) }, theme, false, false);
+    const bars = !useBars.length ? "" : useBars.length > 1 ? renderMultiBars(barData, theme, false, false) : renderDataBars({ ...barData, series: data.categories.map((label, i) => ({ label, value: useBars[0].values[i], format: data.format })) }, theme, false, false);
     const lineMax = Math.max(1, ...lineSeries.flatMap((s) => s.values.map((v) => Math.abs(v))));
     const lines = lineSeries
       .map((s, i) => `<path d="${escapeAttribute(linePath(s.values, lineMax))}" fill="none" stroke="${escapeAttribute(theme[(barSeries.length + i) % theme.length])}" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" />`)
