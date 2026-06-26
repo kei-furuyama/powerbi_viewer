@@ -2398,33 +2398,120 @@
       return { kind: "card", value: evaluated.value, text: formatMeasureValue(evaluated.value, evaluated.format), label: valueField.display };
     }
 
-    // カテゴリ系チャート
+    // カテゴリ系チャート(複数系列対応)
     if (categoryColumn && valueField) {
+      const seriesField = seriesFieldOf(visual, null);
+      // 軸カテゴリは系列フィールドを除いた最初のカテゴリ
+      const axisField = categories.find((f) => !seriesField || f.label !== seriesField.label) || categoryField;
+      const axisColumn = resolveColumn(table, axisField.name) || categoryColumn;
+      const seriesColumn = seriesField ? resolveColumn(table, seriesField.name) : null;
+      const valueFields = values; // 複数measure = 複数系列
+
+      // カテゴリごとにレコードをまとめる(出現順を維持)
       const groups = new Map();
       for (const record of records) {
-        const label = String(record[categoryColumn] ?? "").trim() || "(空白)";
+        const label = String(record[axisColumn] ?? "").trim() || "(空白)";
         if (!groups.has(label)) groups.set(label, []);
         groups.get(label).push(record);
       }
-      let series = [...groups.entries()].map(([label, records]) => {
-        const evaluated = evaluateField(valueField, records, table, model);
-        return { label, value: Number(evaluated?.value) || 0, format: evaluated?.format || "" };
-      });
-      if (!type.includes("line") && !type.includes("area")) {
-        series.sort((a, b) => b.value - a.value);
+      let categoriesList = [...groups.keys()];
+
+      // 系列の構築: (1) Series列でピボット / (2) 複数measure / (3) 単一
+      let seriesList;
+      if (seriesColumn) {
+        const seriesVals = [];
+        const seen = new Set();
+        for (const record of records) {
+          const sv = String(record[seriesColumn] ?? "").trim() || "(空白)";
+          if (!seen.has(sv)) { seen.add(sv); seriesVals.push(sv); }
+          if (seriesVals.length >= 8) break;
+        }
+        seriesList = seriesVals.map((sv) => ({
+          name: sv,
+          format: "",
+          values: categoriesList.map((cl) => {
+            const recs = groups.get(cl).filter((r) => (String(r[seriesColumn] ?? "").trim() || "(空白)") === sv);
+            return Number(evaluateField(valueField, recs, table, model)?.value) || 0;
+          }),
+        }));
+        seriesList.forEach((s) => { s.format = evaluateField(valueField, [], table, model)?.format || ""; });
+      } else if (valueFields.length > 1) {
+        seriesList = valueFields.map((vf) => ({
+          name: vf.display,
+          format: "",
+          values: categoriesList.map((cl) => {
+            const evaluated = evaluateField(vf, groups.get(cl), table, model);
+            return Number(evaluated?.value) || 0;
+          }),
+        }));
+        seriesList.forEach((s, i) => { s.format = evaluateField(valueFields[i], [], table, model)?.format || ""; });
+      } else {
+        let fmt = "";
+        const valuesArr = categoriesList.map((cl) => {
+          const evaluated = evaluateField(valueField, groups.get(cl), table, model);
+          fmt = evaluated?.format || fmt;
+          return Number(evaluated?.value) || 0;
+        });
+        seriesList = [{ name: valueField.display, format: fmt, values: valuesArr }];
       }
-      series = series.slice(0, 12);
-      const max = Math.max(1, ...series.map((point) => Math.abs(point.value)));
+
+      const isLine = type.includes("line") || type.includes("area");
+      const stacked = /stacked/i.test(type);
+      const normalized = /hundredpercent|100/i.test(type);
+
+      // 並べ替え(棒/列は合計降順、折れ線は出現順)＋上限
+      if (!isLine) {
+        const order = categoriesList
+          .map((label, index) => ({ index, total: seriesList.reduce((sum, s) => sum + Math.abs(s.values[index]), 0) }))
+          .sort((a, b) => b.total - a.total)
+          .slice(0, 12)
+          .map((entry) => entry.index);
+        categoriesList = order.map((i) => categoriesList[i]);
+        seriesList = seriesList.map((s) => ({ ...s, values: order.map((i) => s.values[i]) }));
+      } else if (categoriesList.length > 24) {
+        categoriesList = categoriesList.slice(0, 24);
+        seriesList = seriesList.map((s) => ({ ...s, values: s.values.slice(0, 24) }));
+      }
+
+      // スケール基準: 集合=単一最大 / 積み上げ=カテゴリ合計の最大 / 100%=1
+      let max = 1;
+      if (normalized) {
+        max = 1;
+      } else if (stacked) {
+        max = Math.max(1, ...categoriesList.map((_, i) => seriesList.reduce((sum, s) => sum + Math.max(0, s.values[i]), 0)));
+      } else {
+        max = Math.max(1, ...seriesList.flatMap((s) => s.values.map((v) => Math.abs(v))));
+      }
+
+      const format = seriesList[0]?.format || "";
+      // 後方互換: 円/ツリーマップ/単一描画用に先頭系列のポイント配列も保持
+      const points = categoriesList.map((label, i) => ({ label, value: seriesList[0].values[i], format }));
+
       return {
         kind: "category",
-        categoryLabel: categoryField.display,
+        categoryLabel: axisField.display,
         valueLabel: valueField.display,
-        format: series[0]?.format || "",
+        categories: categoriesList,
+        seriesList,
+        multi: seriesList.length > 1,
+        stacked,
+        normalized,
+        format,
         max,
-        series,
+        series: points,
       };
     }
 
+    return null;
+  }
+
+  // Series/Legendロールのフィールド(カテゴリ用とは別)を取得
+  function seriesFieldOf(visual, categoryField) {
+    for (const role of visual.roles || []) {
+      if (!/^(series|legend|group|details)$/i.test(role.role)) continue;
+      const field = role.fields.find((f) => !categoryField || f.label !== categoryField.label);
+      if (field) return field;
+    }
     return null;
   }
 
@@ -2678,14 +2765,18 @@
     }
 
     if (type.includes("line") || type.includes("area")) {
-      const path = data?.kind === "category" ? linePath(data.series, data.max) : "M5 52L28 35L48 42L74 18L96 27L116 10";
-      return `
+      const seriesList = data?.kind === "category" ? data.seriesList : null;
+      const paths = seriesList
+        ? seriesList.map((s, i) => `<path d="${escapeAttribute(linePath(s.values, data.max))}" fill="none" stroke="${escapeAttribute(theme[i % theme.length])}" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" />`).join("")
+        : `<path d="M5 52L28 35L48 42L74 18L96 27L116 10" fill="none" stroke="${escapeAttribute(color)}" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" />`;
+      const svg = `
         <svg class="mini-line" viewBox="0 0 120 64" preserveAspectRatio="none" aria-hidden="true">
           <path d="M5 58H116" stroke="#ded8ca" stroke-width="1" />
-          <path d="${escapeAttribute(path)}" fill="none" stroke="${escapeAttribute(color)}" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" />
+          ${paths}
         </svg>
         ${miniAxis(data?.categoryLabel || categoryLabel, data?.valueLabel || valueLabel)}
       `;
+      return wrapWithChartLegend(visual, data, theme, svg);
     }
 
     if (type.includes("pie") || type.includes("donut")) {
@@ -2701,9 +2792,12 @@
 
     if (type.includes("bar") || type.includes("column") || type.includes("histogram") || type.includes("funnel") || type.includes("waterfall") || type.includes("ribbon")) {
       const horizontal = type.includes("bar") && !type.includes("column");
-      if (data?.kind === "category" && data.series.length) {
+      if (data?.kind === "category" && data.seriesList?.length) {
         const showLabels = visual.style?.dataLabels?.show !== false;
-        return renderDataBars(data, theme, horizontal, showLabels);
+        const chart = data.multi
+          ? renderMultiBars(data, theme, horizontal, showLabels)
+          : renderDataBars(data, theme, horizontal, showLabels);
+        return wrapWithChartLegend(visual, data, theme, chart);
       }
       const heights = [42, 70, 54, 86, 62];
       const bars = heights
@@ -2826,6 +2920,45 @@
     return `<div class="${horizontal ? "hbars" : "vbars"}">${bars}</div>`;
   }
 
+  function renderMultiBars(data, theme, horizontal, showLabels) {
+    const { categories, seriesList, stacked, normalized, max, format } = data;
+    const stack = stacked || normalized;
+    const groups = categories
+      .map((label, ci) => {
+        const denom = normalized
+          ? Math.max(1, seriesList.reduce((sum, ser) => sum + Math.max(0, ser.values[ci]), 0))
+          : max;
+        const segs = seriesList
+          .map((ser, si) => {
+            const value = ser.values[ci];
+            const pct = Math.max(0, (Math.abs(value) / denom) * 100).toFixed(1);
+            const color = escapeAttribute(theme[si % theme.length]);
+            const title = escapeAttribute(`${ser.name} · ${label}: ${formatMeasureValue(value, format)}`);
+            const dim = horizontal ? `width:${pct}%` : `height:${pct}%`;
+            return `<span class="seg" style="${dim};background:${color}" title="${title}"></span>`;
+          })
+          .join("");
+        const labelHtml = `<span class="g-label">${escapeHtml(label)}</span>`;
+        const barsHtml = `<span class="bars ${stack ? "stack" : ""}">${segs}</span>`;
+        return `<div class="mbar-group">${horizontal ? `${labelHtml}${barsHtml}` : `${barsHtml}${labelHtml}`}</div>`;
+      })
+      .join("");
+    void showLabels;
+    return `<div class="mbars ${horizontal ? "h" : "v"}">${groups}</div>`;
+  }
+
+  // チャート(棒/折れ線)に系列凡例を付与。legend.show と複数系列のときのみ
+  function wrapWithChartLegend(visual, data, theme, chartHtml) {
+    if (!data || data.kind !== "category" || !data.multi) return chartHtml;
+    const conf = visual.style?.legend || {};
+    if (conf.show === false) return `<div class="chart-wrap legend-none"><div class="chart-main">${chartHtml}</div></div>`;
+    const position = conf.position || "bottom";
+    const items = data.seriesList
+      .map((ser, index) => `<span class="legend-item"><i style="background:${escapeAttribute(theme[index % theme.length])}"></i>${escapeHtml(ser.name)}</span>`)
+      .join("");
+    return `<div class="chart-wrap legend-${escapeAttribute(position)}"><div class="chart-main">${chartHtml}</div><div class="mini-legend chart-legend">${items}</div></div>`;
+  }
+
   function renderTreemap(data, theme, categoryLabel, valueLabel) {
     const series = data?.kind === "category" ? data.series.filter((point) => point.value > 0) : [];
     if (!series.length) {
@@ -2876,17 +3009,18 @@
     `;
   }
 
-  function linePath(series, max) {
-    if (!series.length) return "M5 58H116";
+  function linePath(values, max) {
+    if (!values.length) return "M5 58H116";
     const left = 5;
     const right = 116;
     const top = 8;
     const bottom = 58;
-    const step = series.length > 1 ? (right - left) / (series.length - 1) : 0;
-    return series
-      .map((point, index) => {
+    const step = values.length > 1 ? (right - left) / (values.length - 1) : 0;
+    return values
+      .map((raw, index) => {
+        const value = typeof raw === "object" && raw ? raw.value : raw; // 数値配列/ポイント配列の両対応
         const x = left + step * index;
-        const ratio = Math.max(0, Math.abs(point.value) / max);
+        const ratio = Math.max(0, Math.abs(Number(value) || 0) / (max || 1));
         const y = bottom - ratio * (bottom - top);
         return `${index === 0 ? "M" : "L"}${x.toFixed(1)} ${y.toFixed(1)}`;
       })

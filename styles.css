@@ -433,8 +433,16 @@ select {
   min-height: 24px;
   overflow: hidden;
   cursor: pointer;
-  display: grid;
-  grid-template-rows: auto 1fr;
+  display: flex;
+  flex-direction: column;
+}
+
+.visual-box > .visual-title {
+  flex: 0 0 auto;
+}
+
+.visual-box > .visual-body {
+  flex: 1 1 auto;
 }
 
 .visual-box:hover,
@@ -477,6 +485,7 @@ select {
   min-height: 0;
   padding: 8px;
   display: grid;
+  grid-template-rows: minmax(0, 1fr);
   align-items: center;
   gap: 4px;
 }
@@ -775,6 +784,107 @@ select {
 }
 
 .vbar-label {
+  font-size: 0.54rem;
+  color: var(--muted);
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 複数系列(集合/積み上げ/100%) */
+.chart-wrap {
+  display: flex;
+  gap: 5px;
+  height: 100%;
+  min-height: 0;
+  align-self: stretch;
+}
+
+.chart-wrap.legend-bottom { flex-direction: column; }
+.chart-wrap.legend-top { flex-direction: column-reverse; }
+.chart-wrap.legend-right { flex-direction: row; }
+.chart-wrap.legend-left { flex-direction: row-reverse; }
+
+.chart-main {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+}
+
+.chart-legend {
+  flex: 0 0 auto;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 10px;
+  font-size: 0.6rem;
+  color: var(--muted);
+}
+
+.chart-wrap.legend-right .chart-legend,
+.chart-wrap.legend-left .chart-legend {
+  flex-direction: column;
+  align-content: flex-start;
+  max-width: 38%;
+}
+
+.mbars.v {
+  display: flex;
+  align-items: flex-end;
+  gap: 5%;
+  height: 100%;
+  min-height: 0;
+}
+
+.mbars.v .mbar-group {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 2px;
+  height: 100%;
+}
+
+.mbars.v .bars {
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  gap: 2px;
+  width: 100%;
+  height: 100%;
+}
+
+.mbars.v .bars.stack { flex-direction: column; justify-content: flex-end; gap: 0; }
+.mbars.v .bars .seg { flex: 1; width: 100%; border-radius: 2px 2px 0 0; min-height: 1px; }
+.mbars.v .bars.stack .seg { flex: 0 0 auto; border-radius: 0; }
+
+.mbars.h {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 4px;
+  height: 100%;
+  min-height: 0;
+}
+
+.mbars.h .mbar-group {
+  display: grid;
+  grid-template-columns: minmax(0, 0.8fr) minmax(0, 2fr);
+  align-items: center;
+  gap: 6px;
+}
+
+.mbars.h .bars { display: flex; flex-direction: column; gap: 1px; height: 15px; justify-content: center; }
+.mbars.h .bars .seg { flex: 1; height: 100%; border-radius: 2px; min-width: 1px; }
+.mbars.h .bars.stack { flex-direction: row; height: 10px; }
+.mbars.h .bars.stack .seg { flex: 0 0 auto; border-radius: 0; }
+
+.mbar-group .g-label {
   font-size: 0.54rem;
   color: var(--muted);
   max-width: 100%;

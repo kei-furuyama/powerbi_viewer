@@ -501,6 +501,46 @@ assert.ok(titles.includes("存在しない列/メジャーを参照"), "detects 
 
 console.log("validation smoke test passed");
 
+// --- 複数系列(B) ---
+const msTmdl = [
+  "table T",
+  "\tmeasure m1 = SUM('T'[v1])",
+  "\tmeasure m2 = SUM('T'[v2])",
+  "\tcolumn k", "\t\tdataType: string",
+  "\tcolumn s", "\t\tdataType: string",
+  "\tcolumn v1", "\t\tdataType: int64",
+  "\tcolumn v2", "\t\tdataType: int64",
+  "\tpartition T = m", "\t\tsource =",
+  "\t\t\tlet Source = Table.FromRows({ {\"A\",\"X\",30,12},{\"A\",\"Y\",20,8},{\"B\",\"X\",25,18},{\"B\",\"Y\",15,6} }, type table [k=text, s=text, v1=Int64.Type, v2=Int64.Type]) in Source",
+].join("\n");
+const mField = (p) => ({ field: { Measure: { Expression: { SourceRef: { Entity: "T" } }, Property: p } }, queryRef: "T." + p, nativeQueryRef: p });
+const cField = (p) => ({ field: { Column: { Expression: { SourceRef: { Entity: "T" } }, Property: p } }, queryRef: "T." + p, nativeQueryRef: p });
+const msVis = (name, vtype, qs) => ({ path: `M.Report/definition/pages/P/visuals/${name}/visual.json`, text: JSON.stringify({ name, position: { x: 0, y: 0, width: 400, height: 240, z: 0 }, visual: { visualType: vtype, query: { queryState: qs } } }), size: 200 });
+const msProject = analyzeProject(
+  [
+    { path: "M.pbip", text: JSON.stringify({ version: "1.0", artifacts: [{ report: { path: "M.Report" } }] }), size: 40 },
+    { path: "M.Report/definition/pages/pages.json", text: JSON.stringify({ pageOrder: ["P"] }), size: 30 },
+    { path: "M.Report/definition/pages/P/page.json", text: JSON.stringify({ name: "P", displayName: "P", width: 1280, height: 720 }), size: 60 },
+    msVis("clust", "clusteredColumnChart", { Category: { projections: [cField("k")] }, Y: { projections: [mField("m1"), mField("m2")] } }),
+    msVis("stack", "stackedColumnChart", { Category: { projections: [cField("k")] }, Series: { projections: [cField("s")] }, Y: { projections: [mField("m1")] } }),
+    { path: "M.SemanticModel/definition/tables/T.tmdl", text: msTmdl, size: 400 },
+  ],
+  [],
+);
+const clust = msProject.report.pages[0].visuals.find((v) => v.id === "clust");
+assert.equal(clust.data.multi, true, "two measures => multi-series");
+assert.equal(clust.data.seriesList.length, 2, "two series");
+assert.equal(clust.data.stacked, false, "clustered not stacked");
+assert.deepEqual(clust.data.categories, ["A", "B"], "categories");
+// A: m1=SUM(30,20)=50, B: m1=SUM(25,15)=40
+assert.deepEqual(clust.data.seriesList[0].values, [50, 40], "series m1 values");
+const stack = msProject.report.pages[0].visuals.find((v) => v.id === "stack");
+assert.equal(stack.data.multi, true, "series pivot => multi");
+assert.equal(stack.data.stacked, true, "stacked detected");
+assert.deepEqual(stack.data.seriesList.map((s) => s.name).sort(), ["X", "Y"], "series from pivot");
+
+console.log("multi-series smoke test passed");
+
 const legacyReportConfig = {
   name: "legacy_donut",
   layouts: [
