@@ -1120,3 +1120,41 @@ console.log("extended DAX functions smoke test passed");
 }
 
 console.log("relationship + time intelligence DAX smoke test passed");
+
+// --- Phase 3: model analysis (RLS / calc groups / refresh policy / best practices) ---
+{
+  const factTmdl = ["table 売上", "\tcolumn 地域ID", "\t\tdataType: int64", "\tcolumn 金額", "\t\tdataType: int64", "\tmeasure 売上合計 = SUM(売上[金額])", "\tcolumn 隠し", "\t\tdataType: string", "\t\tisHidden", "\tpartition 売上 = m", "\t\trefreshPolicy basic"].join("\n");
+  const dimTmdl = ["table 地域", "\tcolumn 地域ID", "\t\tdataType: int64", "\tcolumn 地域名", "\t\tdataType: string"].join("\n");
+  const relTmdl = ["relationship r1", "\tfromColumn: 売上.地域ID", "\ttoColumn: 地域.地域ID", "\tcrossFilteringBehavior: bothDirections"].join("\n");
+  const roleTmdl = ["role 営業", "\ttablePermission 売上 = 売上[地域ID] = 1"].join("\n");
+  const calcTmdl = ["table 時間計算", "\tcalculationGroup", "\t\tcalculationItem 累計 = CALCULATE([売上合計])"].join("\n");
+  const hiddenColField = { Column: { Expression: { SourceRef: { Entity: "売上" } }, Property: "隠し" } };
+  const hiddenProjection = { field: hiddenColField, queryRef: "売上.隠し" };
+  const visual = {
+    name: "v",
+    position: { x: 0, y: 0, width: 100, height: 80, z: 0 },
+    visual: { visualType: "table", query: { queryState: { Values: { projections: [hiddenProjection] } } } },
+  };
+  const proj = analyzeProject([
+    { path: "X.Report/definition/pages/p/visuals/v/visual.json", text: JSON.stringify(visual), size: 200 },
+    { path: "X.Report/definition/pages/p/page.json", text: JSON.stringify({ name: "p", displayName: "P", width: 1280, height: 720 }), size: 80 },
+    { path: "X.Report/definition/pages/pages.json", text: JSON.stringify({ pageOrder: ["p"], activePageName: "p" }), size: 60 },
+    { path: "X.SemanticModel/definition/tables/売上.tmdl", text: factTmdl, size: 300 },
+    { path: "X.SemanticModel/definition/tables/地域.tmdl", text: dimTmdl, size: 200 },
+    { path: "X.SemanticModel/definition/relationships.tmdl", text: relTmdl, size: 120 },
+    { path: "X.SemanticModel/definition/roles.tmdl", text: roleTmdl, size: 100 },
+    { path: "X.SemanticModel/definition/tables/時間計算.tmdl", text: calcTmdl, size: 120 },
+  ], []);
+  assert.equal(proj.semantic.roles.length, 1, "RLSロールが1件抽出される");
+  assert.equal(proj.semantic.roles[0].name, "営業", "ロール名");
+  assert.equal(proj.semantic.calculationGroups.length, 1, "計算グループが1件");
+  assert.equal(proj.semantic.calculationGroups[0].table, "時間計算", "計算グループのテーブル名は宣言から取得");
+  assert.equal(proj.semantic.calculationGroups[0].items.length, 1, "計算項目が1件");
+  assert.ok(proj.semantic.refreshPolicies.length >= 1, "更新ポリシーが検出される");
+  const bpRules = proj.bestPractices.map((b) => b.rule);
+  assert.ok(bpRules.includes("measure-format"), "BPA: 書式無しメジャー");
+  assert.ok(bpRules.includes("bidi-rel"), "BPA: 双方向クロスフィルタ");
+  assert.ok(bpRules.includes("hidden-used"), "BPA: 非表示列をビジュアルで使用");
+}
+
+console.log("model analysis (RLS/calc/refresh/BPA) smoke test passed");

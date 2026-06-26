@@ -1441,6 +1441,55 @@ td code,
   padding-bottom: 10px;
 }
 
+.er-diagram {
+  display: block;
+  width: 100%;
+  max-height: 360px;
+  margin: 4px 0 10px;
+  color: var(--line-strong);
+}
+
+.er-node {
+  fill: var(--surface-soft);
+  stroke: var(--accent);
+  stroke-width: 1.5;
+}
+
+.er-node-label {
+  fill: var(--text, #2c2a24);
+  font-size: 13px;
+  font-weight: 600;
+  text-anchor: middle;
+  dominant-baseline: middle;
+}
+
+.er-edge {
+  stroke: var(--line-strong);
+  stroke-width: 1.5;
+}
+
+.er-edge-label {
+  fill: var(--muted);
+  font-size: 11px;
+  text-anchor: middle;
+}
+
+.bp-list {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  display: grid;
+  gap: 4px;
+}
+
+.bp-list .bp-warning { color: var(--amber); }
+.bp-list .bp-info { color: var(--muted); }
+
+.bp-detail {
+  display: block;
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
 .rel-panel .panel-title {
   padding: 12px 12px 6px;
 }

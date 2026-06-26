@@ -78,6 +78,13 @@ The **モデル (Model)** tab adds static analysis of the semantic model:
   reported as errors, since Power BI refuses to open them.
 - **DAX hints** — e.g. suggesting `DIVIDE()` over `/`, or dropping a table
   qualifier on a measure reference.
+- **Relationship diagram (ER)** — tables as nodes, relationships as edges with
+  cardinality / direction / active state, plus the detail list.
+- **RLS roles, calculation groups, incremental refresh policies** — detected
+  from TMDL and summarized.
+- **Best-practice checks (BPA-style)** — measures without a format string,
+  bidirectional cross-filters, inactive relationships, hidden columns used in
+  visuals. Surfaced in 検出事項 and the analysis JSON (`bestPractices`).
 
 This is also exposed through the CLI/MCP `analyze` output (`measureUsage` plus
 per-measure `used` / `dependsOn` / `referencedBy` / `inCycle`), and circular

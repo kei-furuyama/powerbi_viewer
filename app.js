@@ -340,6 +340,10 @@
       measureUsage = { unused: 0, unusedColumns: 0, cycles: [], lint: [] };
       issues.push({ level: "warning", title: "モデル静的解析を完了できませんでした", detail: String(error?.message || error) });
     }
+    let bestPractices = [];
+    try {
+      bestPractices = computeBestPractices(report, semantic);
+    } catch { /* best-effort */ }
     const validation = validateProject(normalizedEntries, report, semantic, jsonByPath);
 
     // 循環参照はPower BIで開けない致命的エラーなので、整合性検査に統合する(検査の終了コードに反映)
@@ -443,6 +447,10 @@
       });
     }
 
+    for (const bp of bestPractices) {
+      issues.push({ level: bp.level, title: `ベストプラクティス: ${bp.title}`, detail: bp.detail });
+    }
+
     // PBIP整合性チェックの結果を反映(エラー/警告は先頭に集約サマリを置く)
     issues.push(...validation.problems);
     const checkSummary = validation.errors > 0
@@ -460,6 +468,7 @@
       semantic,
       dataModel: { loadedTables: dataModel.loadedTables },
       measureUsage,
+      bestPractices,
       validation,
       issues,
     };
@@ -1700,7 +1709,49 @@
 
     semantic.tables = [...tableMap.values()].sort((a, b) => a.name.localeCompare(b.name));
     semantic.relationships = semantic.relationships.filter((relationship) => relationship.fromTable || relationship.fromColumn || relationship.name);
+    const extras = extractModelExtras(entries);
+    semantic.roles = extras.roles;
+    semantic.calculationGroups = extras.calculationGroups;
+    semantic.refreshPolicies = extras.refreshPolicies;
     return semantic;
+  }
+
+  // RLSロール / 計算グループ / 増分更新ポリシー を TMDL テキストから軽量に抽出
+  function extractModelExtras(entries) {
+    const roles = [];
+    const calculationGroups = [];
+    const refreshPolicies = [];
+    for (const entry of entries.filter((e) => e.path.toLowerCase().endsWith(".tmdl"))) {
+      const lines = entry.text.split(/\r?\n/);
+      let role = null;
+      let calcTable = null;
+      let lastTableName = inferTableNameFromPath(entry.path) || "";
+      for (const raw of lines) {
+        const t = raw.trim();
+        const indent = (raw.match(/^[\t ]*/)[0] || "").length;
+        const roleM = t.match(/^role\s+(.+)$/i);
+        if (roleM) { role = { name: cleanLiteral(roleM[1].trim()), permissions: [] }; roles.push(role); continue; }
+        if (role) {
+          const permM = t.match(/^tablePermission\s+(.+?)\s*=\s*(.*)$/i);
+          if (permM) { role.permissions.push({ table: cleanLiteral(permM[1].trim()), filter: permM[2].trim() }); continue; }
+        }
+        const tableM = t.match(/^table\s+(.+)$/i);
+        if (tableM) { calcTable = null; lastTableName = cleanLiteral(tableM[1].trim()); role = role && indent === 0 ? null : role; }
+        if (/^calculationGroup\b/i.test(t)) {
+          calcTable = { table: lastTableName || "Calculation Group", items: [] };
+          calculationGroups.push(calcTable);
+          continue;
+        }
+        if (calcTable) {
+          const itemM = t.match(/^calculationItem\s+(.+?)\s*=\s*(.*)$/i);
+          if (itemM) { calcTable.items.push({ name: cleanLiteral(itemM[1].trim()), expression: itemM[2].trim() }); continue; }
+        }
+        if (/^refreshPolicy\b/i.test(t)) {
+          refreshPolicies.push({ table: inferTableNameFromPath(entry.path) || "(table)", path: entry.path });
+        }
+      }
+    }
+    return { roles, calculationGroups, refreshPolicies };
   }
 
   function emptySemantic() {
@@ -1708,6 +1759,9 @@
       root: null,
       tables: [],
       relationships: [],
+      roles: [],
+      calculationGroups: [],
+      refreshPolicies: [],
     };
   }
 
@@ -1857,6 +1911,10 @@
 
       if (currentItem?.type === "column" && childOfCurrent && /^sortByColumn\s*:/i.test(line)) {
         currentItem.item.sortByColumn = cleanLiteral(line.split(":").slice(1).join(":").trim());
+      }
+
+      if (childOfCurrent && /^isHidden\b/i.test(line) && (currentItem.type === "column" || currentItem.type === "measure")) {
+        currentItem.item.isHidden = !/:\s*false\b/i.test(line);
       }
     }
 
@@ -3449,6 +3507,35 @@
     return cycles;
   }
 
+  // ベストプラクティス検査(BPA風): 低誤検出の信頼できるルールのみ
+  function computeBestPractices(report, semantic) {
+    const findings = [];
+    const tables = semantic.tables || [];
+    const rels = semantic.relationships || [];
+
+    const noFmt = [];
+    for (const t of tables) for (const m of t.measures || []) if (!m.formatString) noFmt.push(`${t.name}[${m.name}]`);
+    if (noFmt.length) findings.push({ rule: "measure-format", level: "info", title: `書式文字列の無いメジャー ${noFmt.length}件`, detail: noFmt.slice(0, 12).join(" / "), targets: noFmt });
+
+    const bidi = rels.filter((r) => /both/i.test(r.crossFilter || "") && r.fromTable).map((r) => `${r.fromTable} ↔ ${r.toTable}`);
+    if (bidi.length) findings.push({ rule: "bidi-rel", level: "warning", title: `双方向クロスフィルタのリレーション ${bidi.length}件`, detail: `${bidi.join(" / ")}（曖昧さ・性能の観点で単方向を推奨）`, targets: bidi });
+
+    const inactive = rels.filter((r) => r.isActive === false && r.fromTable).map((r) => `${r.fromTable}[${r.fromColumn}] → ${r.toTable}[${r.toColumn}]`);
+    if (inactive.length) findings.push({ rule: "inactive-rel", level: "info", title: `非アクティブなリレーション ${inactive.length}件`, detail: `${inactive.join(" / ")}（USERELATIONSHIPでのみ有効）`, targets: inactive });
+
+    const usedCols = new Set();
+    for (const v of report.visuals || []) for (const role of v.roles || []) for (const f of role.fields || []) {
+      if (f.table && f.name && (f.kind === "column" || f.kind === "aggregation")) usedCols.add(`${normalizeName(f.table)}|${normalizeName(f.name)}`);
+    }
+    const hiddenUsed = [];
+    for (const t of tables) for (const c of t.columns || []) {
+      if (c.isHidden && usedCols.has(`${normalizeName(t.name)}|${normalizeName(c.name)}`)) hiddenUsed.push(`${t.name}[${c.name}]`);
+    }
+    if (hiddenUsed.length) findings.push({ rule: "hidden-used", level: "warning", title: `非表示の列をビジュアルで使用 ${hiddenUsed.length}件`, detail: hiddenUsed.join(" / "), targets: hiddenUsed });
+
+    return findings;
+  }
+
   function roleFieldsByKind(visual, kind) {
     const result = [];
     for (const role of visual.roles || []) {
@@ -4662,10 +4749,27 @@
     chips.push(totalUnusedCols ? `未使用列 <b>${totalUnusedCols}</b>` : `未使用列 <b>0</b>`);
     if (cycles.length) chips.push(`<span class="bad">循環参照 <b>${cycles.length}</b></span>`);
     if (lintCount) chips.push(`DAX提案 <b>${lintCount}</b>`);
+    const bp = state.project?.bestPractices || [];
+    if (bp.length) chips.push(`ベストプラクティス <b>${bp.length}</b>`);
+    const roles = state.project?.semantic?.roles || [];
+    const calcGroups = state.project?.semantic?.calculationGroups || [];
+    const refresh = state.project?.semantic?.refreshPolicies || [];
+    if (roles.length) chips.push(`RLSロール <b>${roles.length}</b>`);
+    if (calcGroups.length) chips.push(`計算グループ <b>${calcGroups.length}</b>`);
+    if (refresh.length) chips.push(`更新ポリシー <b>${refresh.length}</b>`);
+
     const cycleNote = cycles.length
       ? `<div class="model-summary bad">循環参照: ${cycles.map((ring) => escapeHtml(ring.join(" → ") + " → " + ring[0])).join(" / ")}</div>`
       : "";
-    const summary = `<div class="model-summary">${chips.join("　·　")}</div>` + cycleNote;
+    const bpNote = bp.length
+      ? `<div class="model-summary"><b>ベストプラクティス検査</b><ul class="bp-list">${bp.map((b) => `<li class="bp-${b.level}">${escapeHtml(b.title)}<span class="bp-detail">${escapeHtml(b.detail || "")}</span></li>`).join("")}</ul></div>`
+      : "";
+    const secNote = (roles.length || calcGroups.length || refresh.length)
+      ? `<div class="model-summary">${roles.length ? `<div>🔒 RLSロール: ${roles.map((r) => `${escapeHtml(r.name)}（${r.permissions.length}テーブル）`).join(", ")}</div>` : ""}`
+        + `${calcGroups.length ? `<div>Σ 計算グループ: ${calcGroups.map((c) => `${escapeHtml(c.table)}（${c.items.length}項目）`).join(", ")}</div>` : ""}`
+        + `${refresh.length ? `<div>🔄 増分更新ポリシー: ${refresh.map((r) => escapeHtml(r.table)).join(", ")}</div>` : ""}</div>`
+      : "";
+    const summary = `<div class="model-summary">${chips.join("　·　")}</div>` + cycleNote + bpNote + secNote;
 
     const depLine = (label, items) => {
       if (!items || !items.length) return "";
@@ -4761,9 +4865,55 @@
     return `
       <section class="rel-panel">
         <div class="panel-title">リレーション (${usable.length})</div>
+        ${renderERDiagram(usable)}
         <div class="rel-list">${rows}</div>
       </section>
     `;
+  }
+
+  // テーブルを円周に配置した簡易ER図(SVG)。テーブルが多すぎる場合は省略。
+  function renderERDiagram(usable) {
+    const names = [...new Set(usable.flatMap((r) => [r.fromTable, r.toTable]))];
+    if (names.length < 2 || names.length > 14) return "";
+    const W = 760;
+    const H = Math.max(300, names.length * 30 + 140);
+    const cx = W / 2;
+    const cy = H / 2;
+    const R = Math.min(W, H) / 2 - 80;
+    const pos = new Map();
+    names.forEach((n, i) => {
+      const a = -Math.PI / 2 + (2 * Math.PI * i) / names.length;
+      pos.set(n, { x: cx + R * Math.cos(a), y: cy + R * Math.sin(a) });
+    });
+    const edges = usable.map((r) => {
+      const p = pos.get(r.fromTable);
+      const q = pos.get(r.toTable);
+      if (!p || !q) return "";
+      const both = /both/i.test(r.crossFilter || "");
+      const many = (r.toCardinality || "").toLowerCase() === "many";
+      const dx = q.x - p.x;
+      const dy = q.y - p.y;
+      const len = Math.hypot(dx, dy) || 1;
+      const off = 26;
+      const x1 = (p.x + (dx / len) * off).toFixed(0);
+      const y1 = (p.y + (dy / len) * off).toFixed(0);
+      const x2 = (q.x - (dx / len) * off).toFixed(0);
+      const y2 = (q.y - (dy / len) * off).toFixed(0);
+      const dash = r.isActive === false ? ' stroke-dasharray="5 4"' : "";
+      const label = many ? "*—*" : "*—1";
+      return `<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" class="er-edge"${dash} marker-end="url(#erHead)"${both ? ' marker-start="url(#erHead)"' : ""} />`
+        + `<text x="${((p.x + q.x) / 2).toFixed(0)}" y="${((p.y + q.y) / 2 - 4).toFixed(0)}" class="er-edge-label">${escapeHtml(label)}</text>`;
+    }).join("");
+    const nodes = names.map((n) => {
+      const p = pos.get(n);
+      const w = Math.min(170, Math.max(72, n.length * 14 + 24));
+      return `<g><rect x="${(p.x - w / 2).toFixed(0)}" y="${(p.y - 16).toFixed(0)}" width="${w}" height="32" rx="7" class="er-node" />`
+        + `<text x="${p.x.toFixed(0)}" y="${(p.y + 5).toFixed(0)}" class="er-node-label">${escapeHtml(n)}</text></g>`;
+    }).join("");
+    return `<svg viewBox="0 0 ${W} ${H}" class="er-diagram" role="img" aria-label="リレーション図">`
+      + `<defs><marker id="erHead" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto">`
+      + `<path d="M0,0 L8,3 L0,6" fill="none" stroke="currentColor" stroke-width="1.2" /></marker></defs>`
+      + `${edges}${nodes}</svg>`;
   }
 
   function formatDaxDisplay(expression) {
