@@ -1807,7 +1807,7 @@
           }
         }
         if (/^refreshPolicy\b/i.test(t)) {
-          refreshPolicies.push({ table: inferTableNameFromPath(entry.path) || "(table)", path: entry.path });
+          refreshPolicies.push({ table: lastTableName || inferTableNameFromPath(entry.path) || "(table)", path: entry.path });
         }
       }
       flush();
@@ -2004,7 +2004,14 @@
     if (!rowsBlock) return null;
 
     const afterRows = rowsStart + rowsBlock.length;
-    const typeIdx = text.indexOf("type table", afterRows);
+    // 同じ Table.FromRows 呼び出しの引数内に探索範囲を限定(後続の別呼び出しを拾わない)
+    const nextCall = text.indexOf("Table.FromRows", afterRows);
+    const searchEnd = nextCall < 0 ? text.length : nextCall;
+    // 空白に寛容に "type table" を探す(type  table / type\ntable)
+    const typeRe = /type\s+table/g;
+    typeRe.lastIndex = afterRows;
+    const typeMatch = typeRe.exec(text);
+    const typeIdx = typeMatch && typeMatch.index < searchEnd ? typeMatch.index : -1;
     let columns = [];
     if (typeIdx >= 0) {
       const colStart = text.indexOf("[", typeIdx);
@@ -2232,18 +2239,22 @@
         tokens.push({ t: "tbl", v: s }); i = j; continue;
       }
       if (c === "[") {
+        // 列名内の ]] はエスケープされた ]
         let j = i + 1; let s = "";
-        while (j < n && text[j] !== "]") s += text[j++];
-        tokens.push({ t: "col", v: s }); i = j + 1; continue;
+        while (j < n) { if (text[j] === "]") { if (text[j + 1] === "]") { s += "]"; j += 2; continue; } j += 1; break; } s += text[j++]; }
+        tokens.push({ t: "col", v: s }); i = j; continue;
       }
       if (/[0-9]/.test(c) || (c === "." && /[0-9]/.test(text[i + 1] || ""))) {
-        let j = i; while (j < n && /[0-9.]/.test(text[j])) j += 1;
+        // 小数点は1個まで(1.2.3 → 1.2 と .3 に分割)
+        let j = i; let seenDot = false;
+        while (j < n) { const ch = text[j]; if (ch >= "0" && ch <= "9") { j += 1; continue; } if (ch === "." && !seenDot) { seenDot = true; j += 1; continue; } break; }
         // 指数表記 1e3 / 1.5E-2 に対応
         if ((text[j] === "e" || text[j] === "E") && /[0-9+-]/.test(text[j + 1] || "")) {
           j += 1; if (text[j] === "+" || text[j] === "-") j += 1;
           while (j < n && /[0-9]/.test(text[j])) j += 1;
         }
-        tokens.push({ t: "num", v: Number(text.slice(i, j)) }); i = j; continue;
+        const nv = Number(text.slice(i, j));
+        tokens.push({ t: "num", v: Number.isNaN(nv) ? 0 : nv }); i = j; continue;
       }
       const two = text.slice(i, i + 2);
       if (["<>", "<=", ">=", "&&", "||"].includes(two)) { tokens.push({ t: "op", v: two }); i += 2; continue; }
@@ -3062,7 +3073,7 @@
     if (name === "LEN") return daxStr(evalDaxNode(args[0], ctx)).length;
     if (name === "UPPER") return daxStr(evalDaxNode(args[0], ctx)).toUpperCase();
     if (name === "LOWER") return daxStr(evalDaxNode(args[0], ctx)).toLowerCase();
-    if (name === "TRIM") return daxStr(evalDaxNode(args[0], ctx)).replace(/\s+/g, " ").trim();
+    if (name === "TRIM") return daxStr(evalDaxNode(args[0], ctx)).replace(/^ +| +$/g, "");
     if (name === "LEFT") { const s = daxStr(evalDaxNode(args[0], ctx)); const n = args[1] ? Math.trunc(toNum(evalDaxNode(args[1], ctx))) : 1; return s.slice(0, Math.max(0, n)); }
     if (name === "RIGHT") { const s = daxStr(evalDaxNode(args[0], ctx)); const n = args[1] ? Math.trunc(toNum(evalDaxNode(args[1], ctx))) : 1; return n <= 0 ? "" : s.slice(-n); }
     if (name === "MID") { const s = daxStr(evalDaxNode(args[0], ctx)); const start = Math.trunc(toNum(evalDaxNode(args[1], ctx))); const len = Math.trunc(toNum(evalDaxNode(args[2], ctx))); return s.slice(Math.max(0, start - 1), Math.max(0, start - 1) + Math.max(0, len)); }
@@ -3156,6 +3167,9 @@
   }
 
   // FORMAT用の日付パターン整形(VBA/DAX風、大文字小文字を問わず m/mm は月として扱う)
+  const MONTHS_FULL = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+  const MONTHS_ABBR = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
   function formatDatePattern(date, pattern) {
     const pad = (n, w = 2) => String(n).padStart(w, "0");
     return String(pattern).replace(/yyyy|yy|mmmm|mmm|mm|dddd|ddd|dd|hh|ss|m|d|h|y/gi, (token) => {
@@ -3163,8 +3177,8 @@
         case "yyyy": return date.getUTCFullYear();
         case "yy": return pad(date.getUTCFullYear() % 100);
         case "y": return date.getUTCFullYear();
-        case "mmmm":
-        case "mmm":
+        case "mmmm": return MONTHS_FULL[date.getUTCMonth()];
+        case "mmm": return MONTHS_ABBR[date.getUTCMonth()];
         case "mm": return pad(date.getUTCMonth() + 1);
         case "m": return date.getUTCMonth() + 1;
         case "dddd":
@@ -3284,17 +3298,33 @@
     if (!Number.isFinite(number)) return "—";
     if (!formatString) return groupThousands(roundTo(number, 2));
 
-    const literals = [...formatString.matchAll(/"([^"]*)"/g)].map((match) => match[1]).join("");
     const core = formatString.replace(/"[^"]*"/g, "").trim();
     const decimalPart = core.split(".")[1] || "";
-    const decimals = (decimalPart.match(/[0#]/g) || []).length;
+    const minDecimals = (decimalPart.match(/0/g) || []).length; // 必須桁(0)
+    const maxDecimals = (decimalPart.match(/[0#]/g) || []).length; // 必須+任意(#)
     const grouped = core.includes(",");
     const percent = core.includes("%");
 
-    let scaled = percent ? number * 100 : number;
-    let text = scaled.toFixed(decimals);
+    const scaled = percent ? number * 100 : number;
+    let text = scaled.toFixed(maxDecimals);
+    // '#' は任意桁: 末尾0を minDecimals まで削る
+    if (maxDecimals > minDecimals && text.includes(".")) {
+      text = text.replace(/0+$/, "");
+      let [ip, dp = ""] = text.split(".");
+      if (dp.length < minDecimals) dp = dp.padEnd(minDecimals, "0");
+      text = dp ? `${ip}.${dp}` : ip;
+    }
     if (grouped) text = groupThousands(text);
-    return `${text}${percent ? "%" : ""}${literals}`;
+
+    // プレースホルダ([0#])の前後の文字を接頭/接尾辞として抽出(引用・\エスケープを解除)。
+    const decodeLit = (s) => s.replace(/"([^"]*)"/g, "$1").replace(/\\(.)/g, "$1");
+    const masked = formatString.replace(/"[^"]*"/g, (m) => " ".repeat(m.length)).replace(/\\./g, "  ");
+    const firstPh = masked.search(/[0#]/);
+    let lastPh = -1;
+    for (let k = masked.length - 1; k >= 0; k -= 1) { if (masked[k] === "0" || masked[k] === "#") { lastPh = k; break; } }
+    const prefix = firstPh > 0 ? decodeLit(formatString.slice(0, firstPh)) : "";
+    const suffix = lastPh >= 0 && lastPh < formatString.length - 1 ? decodeLit(formatString.slice(lastPh + 1).replace(/%/g, "")) : "";
+    return `${prefix}${text}${percent ? "%" : ""}${suffix}`;
   }
 
   function roundTo(value, decimals) {
@@ -3345,8 +3375,10 @@
     let missing = 0;
     for (const visual of report.visuals) {
       if (!visual.imageRef) continue;
-      if (visual.imageRef.url && /^https?:\/\//i.test(visual.imageRef.url)) {
-        visual.imageData = visual.imageRef.url;
+      // data: / http(s): は直接ソース。それ以外は登録リソース名として解決。
+      const direct = visual.imageRef.url || visual.imageRef.name || "";
+      if (/^(data:|https?:\/\/)/i.test(direct)) {
+        visual.imageData = direct;
       } else {
         visual.imageData = resolve(visual.imageRef.name);
         if (!visual.imageData && visual.imageRef.name) missing += 1;
@@ -3744,7 +3776,7 @@
     for (const table of tables) {
       for (const column of table.columns) {
         if (!column.sortByColumn) continue;
-        const target = findColumn(table.name, column.sortByColumn);
+        const target = columnByKey.get(`${identityName(table.name)}|${identityName(column.sortByColumn)}`);
         if (target) usedColumns.add(colKey(target));
       }
     }
@@ -3823,11 +3855,11 @@
 
     const usedCols = new Set();
     for (const v of report.visuals || []) for (const role of v.roles || []) for (const f of role.fields || []) {
-      if (f.table && f.name && (f.kind === "column" || f.kind === "aggregation")) usedCols.add(`${normalizeName(f.table)}|${normalizeName(f.name)}`);
+      if (f.table && f.name && (f.kind === "column" || f.kind === "aggregation")) usedCols.add(`${identityName(f.table)}|${identityName(f.name)}`);
     }
     const hiddenUsed = [];
     for (const t of tables) for (const c of t.columns || []) {
-      if (c.isHidden && usedCols.has(`${normalizeName(t.name)}|${normalizeName(c.name)}`)) hiddenUsed.push(`${t.name}[${c.name}]`);
+      if (c.isHidden && usedCols.has(`${identityName(t.name)}|${identityName(c.name)}`)) hiddenUsed.push(`${t.name}[${c.name}]`);
     }
     if (hiddenUsed.length) findings.push({ rule: "hidden-used", level: "warning", title: `非表示の列をビジュアルで使用 ${hiddenUsed.length}件`, detail: hiddenUsed.join(" / "), targets: hiddenUsed });
 
@@ -3907,7 +3939,7 @@
     if (normalizeName(table.name) === normalizeName(xf.table)) {
       const col = resolveColumn(table, xf.column);
       if (!col) return records;
-      return records.filter((r) => String(r[col] ?? "") === String(xf.value));
+      return records.filter((r) => String(r[col] ?? "").trim() === String(xf.value).trim());
     }
     // 別テーブル: リレーションで結合キーをたどって絞り込む
     const model = dataModel.byName;
@@ -3927,7 +3959,7 @@
     const dimKeyCol = resolveColumn(xfTable, factIsFrom ? rel.toColumn : rel.fromColumn);
     const dimValCol = resolveColumn(xfTable, xf.column);
     if (!factKey || !dimKeyCol || !dimValCol) return records;
-    const keys = new Set(xfTable.records.filter((r) => String(r[dimValCol] ?? "") === String(xf.value)).map((r) => String(r[dimKeyCol] ?? "")));
+    const keys = new Set(xfTable.records.filter((r) => String(r[dimValCol] ?? "").trim() === String(xf.value).trim()).map((r) => String(r[dimKeyCol] ?? "")));
     return records.filter((r) => keys.has(String(r[factKey] ?? "")));
   }
 
@@ -4224,8 +4256,10 @@
         }
       }
 
-      // 並べ替え(棒/列は合計降順、折れ線/ウォーターフォールは出現順)＋上限
-      const keepOrder = isLine || type.includes("waterfall");
+      // 並べ替え(棒/列は合計降順、折れ線/ウォーターフォール/散布図は出現順)＋上限
+      const isScatter = type.includes("scatter") || type.includes("bubble");
+      const keepOrder = isLine || isScatter || type.includes("waterfall");
+      const keepCap = isScatter ? 50 : 24;
       if (!keepOrder) {
         const order = categoriesList
           .map((label, index) => ({ index, total: seriesList.reduce((sum, s) => sum + Math.abs(s.values[index]), 0) }))
@@ -4234,9 +4268,9 @@
           .map((entry) => entry.index);
         categoriesList = order.map((i) => categoriesList[i]);
         seriesList = seriesList.map((s) => ({ ...s, values: order.map((i) => s.values[i]) }));
-      } else if (categoriesList.length > 24) {
-        categoriesList = categoriesList.slice(0, 24);
-        seriesList = seriesList.map((s) => ({ ...s, values: s.values.slice(0, 24) }));
+      } else if (categoriesList.length > keepCap) {
+        categoriesList = categoriesList.slice(0, keepCap);
+        seriesList = seriesList.map((s) => ({ ...s, values: s.values.slice(0, keepCap) }));
       }
 
       // スケール基準: 集合=単一最大 / 積み上げ=カテゴリ合計の最大 / 100%=1

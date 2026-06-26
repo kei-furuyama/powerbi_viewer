@@ -1270,3 +1270,19 @@ console.log("phase 1-4 audit fixes smoke test passed");
 }
 
 console.log("full-review audit fixes smoke test passed");
+
+// --- full-review batch 2 fixes ---
+{
+  const M = new Map(); const tb = { columns: [], records: [{}] };
+  const dx = (e) => evaluateDax(e, [{}], tb, M);
+  assert.equal(dx('FORMAT(1234.5, "#,##0.##")'), "1,234.5", "#28 # optional digit no trailing zero");
+  assert.equal(dx('FORMAT(1234, "#,##0.##")'), "1,234", "#28 # drops empty decimals");
+  assert.equal(dx('FORMAT(1.5, "0.00")'), "1.50", "#28 0 keeps mandatory decimals");
+  assert.equal(dx('FORMAT(1234.5, "$#,##0.00")'), "$1,234.50", "#29 currency prefix");
+  assert.equal(dx('FORMAT(DATE(2024,3,5), "mmm")'), "Mar", "#41 month abbr");
+  assert.equal(dx('FORMAT(DATE(2024,3,5), "mmmm")'), "March", "#41 month full");
+  assert.equal(dx('TRIM("a  b  c")'), "a  b  c", "#40 TRIM keeps internal spaces");
+  assert.equal(dx("1.2.3"), 1.2, "#38 single decimal point");
+}
+
+console.log("full-review batch 2 smoke test passed");
