@@ -3749,6 +3749,33 @@
       return { kind: "multicard", cards };
     }
 
+    // 地図: 緯度経度があれば実座標、無ければ地域＋値のバブル
+    if (type.includes("map")) {
+      const latField = fieldByRole(visual, /lat/i);
+      const lonField = fieldByRole(visual, /lon/i);
+      const locColumn = categoryColumn || (latField ? null : resolveColumn(table, (categories[0] || values[0])?.name));
+      const points = [];
+      if (locColumn) {
+        const groups = new Map();
+        for (const record of records) {
+          const label = String(record[locColumn] ?? "").trim();
+          if (!label) continue;
+          if (!groups.has(label)) groups.set(label, []);
+          groups.get(label).push(record);
+        }
+        for (const [label, recs] of groups) {
+          let value = recs.length;
+          if (valueField) { const ev = evaluateField(valueField, recs, table, model); value = ev ? Number(ev.value) || 0 : recs.length; }
+          const lat = latField ? Number(recs[0][resolveColumn(table, latField.name)]) : NaN;
+          const lon = lonField ? Number(recs[0][resolveColumn(table, lonField.name)]) : NaN;
+          points.push({ label, value, lat, lon });
+        }
+      }
+      if (!points.length) return null;
+      const hasGeo = points.every((p) => Number.isFinite(p.lat) && Number.isFinite(p.lon));
+      return { kind: "map", points: points.slice(0, 40), hasGeo };
+    }
+
     // ゲージ: 値・最小・最大・目標をロール名から取得し弧を算出
     if (type.includes("gauge")) {
       const byRole = (re) => {
@@ -4156,6 +4183,14 @@
     return result;
   }
 
+  // ロール名が正規表現にマッチする最初のフィールド(緯度経度等の特殊ロール用)
+  function fieldByRole(visual, re) {
+    for (const role of visual.roles || []) {
+      if (re.test(role.role)) return role.fields[0] || null;
+    }
+    return null;
+  }
+
   function renderVisualPreview(visual, theme = DEFAULT_THEME_COLORS, fontScale = 0.583) {
     const type = visual.type.toLowerCase();
     const categories = roleFieldsOf(visual, "category");
@@ -4291,6 +4326,30 @@
     }
 
     if (type.includes("map")) {
+      if (data?.kind === "map" && data.points.length) {
+        const pts = data.points;
+        const maxV = Math.max(...pts.map((p) => p.value), 1);
+        if (data.hasGeo) {
+          const lats = pts.map((p) => p.lat);
+          const lons = pts.map((p) => p.lon);
+          const minLa = Math.min(...lats);
+          const maxLa = Math.max(...lats);
+          const minLo = Math.min(...lons);
+          const maxLo = Math.max(...lons);
+          const nx = (lo) => (maxLo === minLo ? 50 : ((lo - minLo) / (maxLo - minLo)) * 86 + 7);
+          const ny = (la) => (maxLa === minLa ? 50 : (1 - (la - minLa) / (maxLa - minLa)) * 82 + 9);
+          const dots = pts.map((p, i) => {
+            const r = 8 + (p.value / maxV) * 22;
+            return `<span title="${escapeAttribute(`${p.label}: ${p.value}`)}" style="left:${nx(p.lon).toFixed(1)}%;top:${ny(p.lat).toFixed(1)}%;width:${r.toFixed(0)}px;height:${r.toFixed(0)}px;background:${escapeAttribute(theme[i % theme.length])}"></span>`;
+          }).join("");
+          return `<div class="mini-map">${dots}</div>`;
+        }
+        const bubbles = pts.slice(0, 12).map((p, i) => {
+          const r = 26 + (p.value / maxV) * 40;
+          return `<div class="map-bubble" style="width:${r.toFixed(0)}px;height:${r.toFixed(0)}px;background:${escapeAttribute(theme[i % theme.length])}" title="${escapeAttribute(`${p.label}: ${p.value}`)}"><span>${escapeHtml(p.label)}</span></div>`;
+        }).join("");
+        return `<div class="mini-map-bubbles">${bubbles}</div>`;
+      }
       return `
         <div class="mini-map" aria-hidden="true">
           <span style="left: 22%; top: 38%; background:${escapeAttribute(theme[0])}"></span>

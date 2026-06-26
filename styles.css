@@ -905,6 +905,43 @@ select {
   height: 14px;
   border-radius: 50%;
   background: rgba(185, 59, 95, 0.72);
+  transform: translate(-50%, -50%);
+  opacity: 0.82;
+}
+
+/* 座標が無い地図: 値で大きさを変えた地域バブル */
+.mini-map-bubbles {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  align-content: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 54px;
+  height: 100%;
+  background:
+    linear-gradient(120deg, rgba(0, 124, 114, 0.1), transparent 45%),
+    #f6f5ef;
+  padding: 6px;
+}
+
+.map-bubble {
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0.85;
+  overflow: hidden;
+}
+
+.map-bubble span {
+  color: #fff;
+  font-size: 0.6rem;
+  font-weight: 600;
+  text-align: center;
+  line-height: 1.05;
+  padding: 1px;
+  text-shadow: 0 1px 1px rgba(0, 0, 0, 0.35);
 }
 
 .mini-axis {
