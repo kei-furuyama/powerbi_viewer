@@ -19,6 +19,7 @@
           </div>
         </div>
         <div class="actions">
+          <span class="local-badge" title="読み込んだファイルは外部に送信されず、ブラウザ内だけで処理されます">🔒 ローカル処理 / 非通信</span>
           <label class="button primary">
             <input id="folderInput" type="file" webkitdirectory multiple />
             フォルダを開く
@@ -53,6 +54,10 @@
               <div class="drop-icon" aria-hidden="true">PBIP</div>
               <h2>Power BI Projectを解析</h2>
               <p>`.pbip`を含むフォルダ、またはzipをここにドロップできます。</p>
+              <div class="privacy-note">
+                <span class="privacy-badge" aria-hidden="true">🔒</span>
+                <span>読み込んだファイルは<b>外部に送信されず</b>、すべてあなたのブラウザ内（ローカル）で処理されます。サーバーへのアップロードや通信は行いません。</span>
+              </div>
               <div class="need-files">
                 <div class="need-title">「フォルダを開く」で必要なファイル</div>
                 <p class="need-note">PBIPプロジェクトの<b>フォルダごと</b>選択してください（サブフォルダも含めて読み込みます）。最低限あると解析できる主なファイル:</p>
