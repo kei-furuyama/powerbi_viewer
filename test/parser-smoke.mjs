@@ -1178,3 +1178,49 @@ console.log("model analysis (RLS/calc/refresh/BPA) smoke test passed");
 }
 
 console.log("slicer cross-filter data smoke test passed");
+
+// --- phase 1-4 audit fixes: cross-table DAX, time intelligence, model extras ---
+{
+  const sales = { name: "Sales", columns: [{ name: "PK" }, { name: "Amount" }], records: [{ PK: 1, Amount: 100 }, { PK: 1, Amount: 50 }, { PK: 2, Amount: 200 }, { PK: 3, Amount: 30 }], measures: new Map() };
+  const prod = { name: "Product", columns: [{ name: "PK" }, { name: "Cat" }], records: [{ PK: 1, Cat: "A" }, { PK: 2, Cat: "B" }, { PK: 3, Cat: "A" }], measures: new Map() };
+  const m = new Map([["Sales", sales], ["Product", prod]]);
+  m.relationships = [{ fromTable: "Sales", fromColumn: "PK", toTable: "Product", toColumn: "PK", isActive: true }];
+  assert.equal(evaluateDax("SUM(Product[PK])", sales.records, sales, m), 6, "#2 cross-table aggregation");
+  assert.equal(evaluateDax('CALCULATE(SUM(Sales[Amount]), Product[Cat]="A")', sales.records, sales, m), 180, "#1 CALCULATE dim predicate -> fact");
+  assert.equal(evaluateDax('CALCULATE(SUM(Sales[Amount]), FILTER(ALL(Product), Product[Cat]="A"))', sales.records, sales, m), 180, "#1 CALCULATE FILTER(ALL(dim))");
+  assert.equal(evaluateDax('CONCATENATEX(Sales, CALCULATE(RELATED(Product[Cat])), "")', sales.records, sales, m), "AABA", "#3 RELATED inside CALCULATE keeps row context");
+}
+{
+  // #16 dim measure referencing fact measure, iterated (context transition)
+  const f = { name: "Fact", columns: [{ name: "K" }, { name: "V" }], records: [{ K: 1, V: 100 }, { K: 1, V: 50 }, { K: 2, V: 200 }], measures: new Map([["FV", { name: "FV", expression: "SUM(Fact[V])" }]]) };
+  const d = { name: "Dim", columns: [{ name: "K" }], records: [{ K: 1 }, { K: 2 }], measures: new Map() };
+  const m2 = new Map([["Fact", f], ["Dim", d]]); m2.relationships = [{ fromTable: "Fact", fromColumn: "K", toTable: "Dim", toColumn: "K", isActive: true }];
+  assert.equal(evaluateDax("SUMX(Dim, [FV])", d.records, d, m2), 350, "#16 cross-table measure ref context transition");
+}
+{
+  // #4/#5 time intelligence barewords + off-by-one
+  const tt = { name: "T", columns: [{ name: "D" }, { name: "V" }], records: [{ D: "2024-01-15", V: 10 }, { D: "2024-02-10", V: 20 }, { D: "2024-03-05", V: 30 }, { D: "2023-02-10", V: 7 }], measures: new Map() };
+  const tm = new Map([["T", tt]]); tm.relationships = [];
+  assert.equal(evaluateDax("CALCULATE(SUM(T[V]), DATEADD(T[D], -1, YEAR))", tt.records, tt, tm), 7, "#4 DATEADD bareword YEAR");
+  assert.equal(evaluateDax("CALCULATE(SUM(T[V]), DATESINPERIOD(T[D], DATE(2024,2,10), 3, DAY))", tt.records, tt, tm), 20, "#5 DATESINPERIOD exact window");
+}
+{
+  // #6 cross-table time intelligence
+  const sales = { name: "S", columns: [{ name: "DK" }, { name: "A" }], records: [{ DK: "2024-01-15", A: 10 }, { DK: "2024-06-20", A: 20 }, { DK: "2023-03-01", A: 5 }], measures: new Map() };
+  const cal = { name: "C", columns: [{ name: "DK" }, { name: "Date" }], records: [{ DK: "2024-01-15", Date: "2024-01-15" }, { DK: "2024-06-20", Date: "2024-06-20" }, { DK: "2023-03-01", Date: "2023-03-01" }], measures: new Map() };
+  const m = new Map([["S", sales], ["C", cal]]); m.relationships = [{ fromTable: "S", fromColumn: "DK", toTable: "C", toColumn: "DK", isActive: true }];
+  assert.equal(evaluateDax("TOTALYTD(SUM(S[A]), C[Date])", sales.records, sales, m), 30, "#6 cross-table TOTALYTD");
+}
+{
+  // #9/#18 multi-line calculationItem + tablePermission
+  const calc = ["table TC", "\tcalculationGroup", "\t\tcalculationItem 累計 =", "\t\t\tCALCULATE(", "\t\t\t\t[X]", "\t\t\t)"].join("\n");
+  const roleT = ["role R", "\ttablePermission Sales =", "\t\tSales[K] = 1"].join("\n");
+  const proj = analyzeProject([
+    { path: "MX.SemanticModel/definition/tables/TC.tmdl", text: calc, size: 120 },
+    { path: "MX.SemanticModel/definition/roles.tmdl", text: roleT, size: 80 },
+  ], []);
+  assert.ok(/CALCULATE/.test(proj.semantic.calculationGroups[0].items[0].expression), "#9 multi-line calculationItem captured");
+  assert.ok(/Sales\[K\]/.test(proj.semantic.roles[0].permissions[0].filter), "#18 multi-line tablePermission captured");
+}
+
+console.log("phase 1-4 audit fixes smoke test passed");

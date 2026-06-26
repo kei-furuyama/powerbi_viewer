@@ -60,6 +60,7 @@
     els.pageSelect.addEventListener("change", (event) => {
       state.selectedPageId = event.target.value;
       state.selectedVisualId = null;
+      state.crossFilter = null; // クロスフィルタはページ単位
       renderCanvas();
       renderPages();
     });
@@ -1722,19 +1723,39 @@
     const roles = [];
     const calculationGroups = [];
     const refreshPolicies = [];
+    const dedentLines = (arr) => {
+      const nb = arr.filter((l) => l.trim());
+      const min = nb.length ? Math.min(...nb.map((l) => (l.match(/^[\t ]*/)[0] || "").length)) : 0;
+      return arr.map((l) => l.slice(min)).join("\n").replace(/\s+$/, "").trim();
+    };
     for (const entry of entries.filter((e) => e.path.toLowerCase().endsWith(".tmdl"))) {
       const lines = entry.text.split(/\r?\n/);
       let role = null;
       let calcTable = null;
       let lastTableName = inferTableNameFromPath(entry.path) || "";
+      let pending = null; // 複数行の式/フィルタを集める { target, key, ownIndent, lines }
+      const flush = () => {
+        if (pending && pending.lines.length) pending.target[pending.key] = dedentLines(pending.lines);
+        pending = null;
+      };
       for (const raw of lines) {
         const t = raw.trim();
         const indent = (raw.match(/^[\t ]*/)[0] || "").length;
+        if (pending) {
+          if (!t) { pending.lines.push(raw); continue; }
+          if (indent > pending.ownIndent) { pending.lines.push(raw); continue; }
+          flush();
+        }
         const roleM = t.match(/^role\s+(.+)$/i);
         if (roleM) { role = { name: cleanLiteral(roleM[1].trim()), permissions: [] }; roles.push(role); continue; }
         if (role) {
           const permM = t.match(/^tablePermission\s+(.+?)\s*=\s*(.*)$/i);
-          if (permM) { role.permissions.push({ table: cleanLiteral(permM[1].trim()), filter: permM[2].trim() }); continue; }
+          if (permM) {
+            const p = { table: cleanLiteral(permM[1].trim()), filter: permM[2].trim() };
+            role.permissions.push(p);
+            if (!p.filter) pending = { target: p, key: "filter", ownIndent: indent, lines: [] };
+            continue;
+          }
         }
         const tableM = t.match(/^table\s+(.+)$/i);
         if (tableM) { calcTable = null; lastTableName = cleanLiteral(tableM[1].trim()); role = role && indent === 0 ? null : role; }
@@ -1745,12 +1766,18 @@
         }
         if (calcTable) {
           const itemM = t.match(/^calculationItem\s+(.+?)\s*=\s*(.*)$/i);
-          if (itemM) { calcTable.items.push({ name: cleanLiteral(itemM[1].trim()), expression: itemM[2].trim() }); continue; }
+          if (itemM) {
+            const item = { name: cleanLiteral(itemM[1].trim()), expression: itemM[2].trim() };
+            calcTable.items.push(item);
+            if (!item.expression) pending = { target: item, key: "expression", ownIndent: indent, lines: [] };
+            continue;
+          }
         }
         if (/^refreshPolicy\b/i.test(t)) {
           refreshPolicies.push({ table: inferTableNameFromPath(entry.path) || "(table)", path: entry.path });
         }
       }
+      flush();
     }
     return { roles, calculationGroups, refreshPolicies };
   }
@@ -2352,7 +2379,7 @@
       case "num": return node.v;
       case "str": return node.v;
       case "unary": return -toNum(evalDaxNode(node.e, ctx));
-      case "col": return ctx.row ? ctx.row[resolveColumn(ctx.table, node.name)] ?? null : null;
+      case "col": return evalDaxColRef(node, ctx);
       case "ref": return evalDaxRef(node.name, ctx);
       case "name": return evalDaxName(node.name, ctx);
       case "tableName": return null;
@@ -2360,6 +2387,21 @@
       case "call": return evalDaxCall(node, ctx);
       default: return null;
     }
+  }
+
+  // 列参照: 修飾子(node.table)を尊重。別テーブルならリレーションをたどる(RELATED相当)。
+  function evalDaxColRef(node, ctx) {
+    if (!ctx.row) return null;
+    const t = node.table
+      ? (ctx.model?.get(node.table) || ctx.model?.get(normalizeName(node.table)) || ctx.table)
+      : ctx.table;
+    if (!t) return null;
+    if (ctx.table && normalizeName(t.name) === normalizeName(ctx.table.name)) {
+      return ctx.row[resolveColumn(ctx.table, node.name)] ?? null;
+    }
+    const related = relatedRow(ctx, t.name);
+    if (related) return related[resolveColumn(t, node.name)] ?? null;
+    return null;
   }
 
   function evalDaxRef(name, ctx) {
@@ -2378,10 +2420,24 @@
         if (table === ctx.table || !table.measures?.has(name)) continue;
         if (ctx.stack.has(name)) return null;
         ctx.stack.add(name);
+        // 行コンテキストがある場合(反復子内)は、現在行に関連する行だけへ文脈変換(過剰計上防止)
+        let measureRows = table.records;
+        if (ctx.row && ctx.table) {
+          const rel = findRelationship(ctx, ctx.table.name, table.name);
+          if (rel) {
+            const factIsFrom = normalizeName(rel.fromTable) === normalizeName(ctx.table.name);
+            const localCol = resolveColumn(ctx.table, factIsFrom ? rel.fromColumn : rel.toColumn);
+            const remoteCol = resolveColumn(table, factIsFrom ? rel.toColumn : rel.fromColumn);
+            const localVal = String(ctx.row[localCol] ?? "");
+            measureRows = table.records.filter((r) => String(r[remoteCol] ?? "") === localVal);
+          } else {
+            measureRows = [];
+          }
+        }
         const result = evaluateMeasureExpression(table.measures.get(name).expression, {
           ...ctx,
           table,
-          rows: table.records,
+          rows: measureRows,
           row: null,
           vars: {},
         });
@@ -2505,18 +2561,52 @@
   }
 
   // 現在のフィルタ文脈に含まれる日付値(日付列が ctx.table 上なら ctx.rows、別表なら全体)
+  // 現在のフィルタ文脈(ctx.rows)を、別テーブルの日付列へリレーション経由で写像
+  function dateFactBridge(ctx, table) {
+    if (!ctx.table || table === ctx.table) return null;
+    const rel = findRelationship(ctx, ctx.table.name, table.name);
+    if (!rel) return null;
+    const factIsFrom = normalizeName(rel.fromTable) === normalizeName(ctx.table.name);
+    return {
+      factCol: resolveColumn(ctx.table, factIsFrom ? rel.fromColumn : rel.toColumn),
+      dateKeyCol: resolveColumn(table, factIsFrom ? rel.toColumn : rel.fromColumn),
+    };
+  }
+
   function contextDateValues(ctx, node) {
     const { table, key } = resolveDateColumn(ctx, node);
     if (!table || !key) return [];
-    const rows = table === ctx.table ? ctx.rows : table.records || [];
+    let rows;
+    if (table === ctx.table) {
+      rows = ctx.rows;
+    } else {
+      const bridge = dateFactBridge(ctx, table);
+      if (bridge) {
+        const factKeys = new Set((ctx.rows || []).map((r) => String(r[bridge.factCol] ?? "")));
+        rows = table.records.filter((r) => factKeys.has(String(r[bridge.dateKeyCol] ?? "")));
+      } else {
+        rows = table.records || [];
+      }
+    }
     return rows.map((r) => toDate(r[key])).filter(Boolean);
   }
 
-  // 日付テーブルの行を期間述語で絞る
+  // 期間述語に合致する行を返す。日付列が別テーブルなら合致する日付キーをファクト行へ写像。
   function dateRowsInRange(ctx, node, inRange) {
     const { table, key } = resolveDateColumn(ctx, node);
     if (!table || !key) return ctx.rows;
-    return table.records.filter((r) => { const d = toDate(r[key]); return d && inRange(d); });
+    const dateRows = table.records.filter((r) => { const d = toDate(r[key]); return d && inRange(d); });
+    if (table === ctx.table) return dateRows;
+    const bridge = dateFactBridge(ctx, table);
+    if (!bridge) return dateRows;
+    const dateKeys = new Set(dateRows.map((r) => String(r[bridge.dateKeyCol] ?? "")));
+    return (ctx.table.records || ctx.rows || []).filter((r) => dateKeys.has(String(r[bridge.factCol] ?? "")));
+  }
+
+  // 期間単位(DAY/MONTH/QUARTER/YEAR)。素の識別子(name)はトークン文字列をそのまま使う
+  function daxUnitOf(arg, ctx) {
+    if (arg && (arg.type === "name" || arg.type === "tableName")) return arg.name;
+    return String(arg ? (evalDaxNode(arg, ctx) ?? "DAY") : "DAY");
   }
 
   function shiftDate(date, n, unit) {
@@ -2581,8 +2671,12 @@
         return target.records.filter((r) => valSet.has(String(r[tkey] ?? "")));
       }
       if (name === "ALLEXCEPT") {
-        // ALLEXCEPT(table, cols…): 指定列のフィルタのみ残す近似 → ここでは全行を返す(行フィルタ解除)
-        return ctx.table?.records || ctx.rows;
+        // ALLEXCEPT(table, cols…): 指定列のフィルタだけ残し、他は解除
+        const recs = ctx.table?.records || ctx.rows || [];
+        const keepCols = node.args.slice(1).map((a) => resolveColumn(ctx.table, a.name)).filter(Boolean);
+        if (!keepCols.length) return recs;
+        const allowed = keepCols.map((c) => new Set((ctx.rows || []).map((r) => String(r[c] ?? ""))));
+        return recs.filter((r) => keepCols.every((c, i) => allowed[i].has(String(r[c] ?? ""))));
       }
       // --- タイムインテリジェンス(日付集合を返す) ---
       if (name === "DATESYTD" || name === "DATESMTD" || name === "DATESQTD") {
@@ -2597,12 +2691,17 @@
       }
       if (name === "SAMEPERIODLASTYEAR") {
         const dates = contextDateValues(ctx, node.args[0]);
-        const shifted = new Set(dates.map((d) => Date.UTC(d.getUTCFullYear() - 1, d.getUTCMonth(), d.getUTCDate())));
+        // 閏日(2/29)は前年に存在せず月がずれるため除外(DAXと同じ)
+        const shifted = new Set();
+        for (const d of dates) {
+          const t = Date.UTC(d.getUTCFullYear() - 1, d.getUTCMonth(), d.getUTCDate());
+          if (new Date(t).getUTCMonth() === d.getUTCMonth()) shifted.add(t);
+        }
         return dateRowsInRange(ctx, node.args[0], (d) => shifted.has(d.getTime()));
       }
       if (name === "DATEADD") {
         const n = Math.trunc(toNum(evalDaxNode(node.args[1], ctx)));
-        const unit = String(node.args[2] ? evalDaxNode(node.args[2], ctx) : "DAY");
+        const unit = daxUnitOf(node.args[2], ctx);
         const dates = contextDateValues(ctx, node.args[0]);
         const shifted = new Set(dates.map((d) => shiftDate(d, n, unit).getTime()));
         return dateRowsInRange(ctx, node.args[0], (d) => shifted.has(d.getTime()));
@@ -2610,9 +2709,11 @@
       if (name === "DATESINPERIOD") {
         const start = toDate(evalDaxNode(node.args[1], ctx));
         const n = toNum(evalDaxNode(node.args[2], ctx));
-        const unit = String(node.args[3] ? evalDaxNode(node.args[3], ctx) : "DAY");
+        const unit = daxUnitOf(node.args[3], ctx);
         if (!start) return ctx.rows;
-        const end = shiftDate(start, n, unit);
+        // 遠い端点は排他: 1日縮めて窓に正確に |n| 日(または1か月等)が入るように
+        let end = shiftDate(start, n, unit);
+        end = new Date(end.getTime() + (n >= 0 ? -86400000 : 86400000));
         const lo = Math.min(start.getTime(), end.getTime());
         const hi = Math.max(start.getTime(), end.getTime());
         return dateRowsInRange(ctx, node.args[0], (d) => d.getTime() >= lo && d.getTime() <= hi);
@@ -2629,7 +2730,12 @@
         return dateRowsInRange(ctx, node.args[0], (d) => d.getTime() >= lo && d.getTime() <= hi);
       }
       if (name === "ALL" || name === "ALLSELECTED" || name === "REMOVEFILTERS" || name === "VALUES" || name === "DISTINCT") {
-        return ctx.table?.records || ctx.rows;
+        // 引数のテーブル(またはTable[Col]の所属テーブル)の全行を返す。引数省略時は文脈テーブル。
+        const a = node.args[0];
+        let t = null;
+        if (a?.type === "name" || a?.type === "tableName") t = ctx.model?.get(a.name) || ctx.model?.get(normalizeName(a.name));
+        else if (a?.type === "col" && a.table) t = ctx.model?.get(a.table) || ctx.model?.get(normalizeName(a.table));
+        return (t || ctx.table)?.records || ctx.rows;
       }
     }
     if (node.type === "name" || node.type === "tableName") {
@@ -2683,7 +2789,8 @@
         }
         rows = applyCalcFilter(rows, filter, { ...ctx, activeRel });
       }
-      return evalDaxNode(args[0], { ...ctx, rows, row: null, activeRel });
+      // 行コンテキストは保持(CALCULATE内のRELATED等が関連行をたどれるように)
+      return evalDaxNode(args[0], { ...ctx, rows, activeRel });
     }
 
     if (name === "COUNTROWS") {
@@ -2722,7 +2829,15 @@
     }
 
     if (DAX_AGGREGATIONS.has(name)) {
-      const values = ctx.rows.map((row) => evalDaxNode(args[0], { ...ctx, row }));
+      // 集計列が別テーブルを修飾している場合は、そのテーブルの行を反復する
+      const arg = args[0];
+      let tbl = ctx.table;
+      let rows = ctx.rows;
+      if (arg && arg.type === "col" && arg.table) {
+        const qt = ctx.model?.get(arg.table) || ctx.model?.get(normalizeName(arg.table));
+        if (qt && qt !== ctx.table) { tbl = qt; rows = qt.records || []; }
+      }
+      const values = rows.map((row) => evalDaxNode(arg, { ...ctx, table: tbl, row, rows }));
       return aggregateValues(name, values);
     }
 
@@ -2973,15 +3088,55 @@
     "PREVIOUSMONTH", "PREVIOUSYEAR", "PREVIOUSQUARTER",
   ]);
 
+  // ブール述語のASTから、参照している(修飾子付き)テーブルを推定
+  function predicateTable(node, ctx) {
+    let found = null;
+    const walk = (n) => {
+      if (!n || found || typeof n !== "object") return;
+      if (n.type === "col" && n.table) {
+        const t = ctx.model?.get(n.table) || ctx.model?.get(normalizeName(n.table));
+        if (t) { found = t; return; }
+      }
+      for (const k of ["l", "r", "e"]) if (n[k]) walk(n[k]);
+      if (Array.isArray(n.args)) for (const a of n.args) walk(a);
+    };
+    walk(node);
+    return found;
+  }
+
   function applyCalcFilter(rows, node, ctx) {
+    if (node.type === "call" && node.name === "USERELATIONSHIP") return rows; // CALCULATE側で処理
     if (node.type === "call" && node.name === "KEEPFILTERS") {
       return applyCalcFilter(rows, node.args[0], ctx);
     }
+
+    let targetTable;
+    let survivors;
     if (node.type === "call" && CALC_TABLE_FNS.has(node.name)) {
-      return resolveTableArg(node, { ...ctx, rows });
+      targetTable = tableOfArg(node, ctx) || ctx.table;
+      survivors = resolveTableArg(node, { ...ctx, rows });
+    } else {
+      targetTable = predicateTable(node, ctx) || ctx.table;
+      if (ctx.table && targetTable && normalizeName(targetTable.name) === normalizeName(ctx.table.name)) {
+        // 同一テーブルの述語: 現在の行集合と積をとる
+        return rows.filter((row) => truthy(evalDaxNode(node, { ...ctx, row, rows })));
+      }
+      const base = targetTable?.records || [];
+      survivors = base.filter((row) => truthy(evalDaxNode(node, { ...ctx, table: targetTable, row, rows: base })));
     }
-    // ブール述語(列 = 値 など)を行フィルタとして適用
-    return rows.filter((row) => truthy(evalDaxNode(node, { ...ctx, row, rows })));
+
+    // 対象テーブルが文脈テーブルと同じなら、絞り込んだ行がそのまま新しい行集合
+    if (!ctx.table || !targetTable || normalizeName(targetTable.name) === normalizeName(ctx.table.name)) {
+      return survivors;
+    }
+    // 別テーブル(ディメンション)の絞り込みを、リレーションのキーでファクト行へ伝播
+    const rel = findRelationship(ctx, ctx.table.name, targetTable.name);
+    if (!rel) return rows;
+    const factIsFrom = normalizeName(rel.fromTable) === normalizeName(ctx.table.name);
+    const factCol = resolveColumn(ctx.table, factIsFrom ? rel.fromColumn : rel.toColumn);
+    const dimCol = resolveColumn(targetTable, factIsFrom ? rel.toColumn : rel.fromColumn);
+    const keys = new Set(survivors.map((r) => String(r[dimCol] ?? "")));
+    return rows.filter((r) => keys.has(String(r[factCol] ?? "")));
   }
 
   function formatMeasureValue(value, formatString) {
@@ -3618,11 +3773,12 @@
     if (!xfTable) return records;
     const ft = normalizeName(table.name);
     const xt = normalizeName(xf.table);
-    const rel = (model.relationships || []).find((r) => {
+    const cands = (model.relationships || []).filter((r) => {
       const a = normalizeName(r.fromTable);
       const b = normalizeName(r.toTable);
       return (a === ft && b === xt) || (a === xt && b === ft);
     });
+    const rel = cands.find((r) => r.isActive !== false) || cands[0];
     if (!rel) return records;
     const factIsFrom = normalizeName(rel.fromTable) === ft;
     const factKey = resolveColumn(table, factIsFrom ? rel.fromColumn : rel.toColumn);
@@ -3653,7 +3809,10 @@
     const records = applyCrossFilter(applyVisualFilters(table.records, visual.filters, table), table, dataModel, visual);
 
     const valueField = values[0];
-    const categoryField = categories[0];
+    // 小さな倍数のフィールドは軸カテゴリから除外(ロール順に依らず実カテゴリを軸に)
+    const smFieldEarly = fieldByRole(visual, /small.?multipl/i);
+    const axisCats = smFieldEarly ? categories.filter((f) => f.label !== smFieldEarly.label) : categories;
+    const categoryField = axisCats[0];
     const categoryColumn = categoryField ? resolveColumn(table, categoryField.name) : null;
 
     // テーブル / マトリックス
@@ -3803,7 +3962,7 @@
     }
 
     // 小さな倍数(Small multiples): SMロールの値ごとにミニチャートへ分割
-    const smField = fieldByRole(visual, /small.?multipl/i);
+    const smField = smFieldEarly;
     if (smField && categoryColumn && valueField) {
       const smCol = resolveColumn(table, smField.name);
       const panelMap = new Map();
@@ -3832,7 +3991,13 @@
         panels.push({ title, series });
       }
       if (panels.length > 1) {
-        return { kind: "smallMultiples", panels: panels.slice(0, 9).map((p) => ({ ...p, max: globalMax || 1, format: fmt })) };
+        const shownPanels = panels.slice(0, 9);
+        const shownMax = shownPanels.reduce((mx, p) => Math.max(mx, ...p.series.map((s) => Math.abs(s.value))), 0);
+        return {
+          kind: "smallMultiples",
+          panels: shownPanels.map((p) => ({ ...p, max: shownMax || 1, format: fmt })),
+          morePanels: Math.max(0, panels.length - shownPanels.length),
+        };
       }
     }
 
@@ -3840,7 +4005,7 @@
     if (categoryColumn && valueField) {
       const seriesField = seriesFieldOf(visual, null);
       // 軸カテゴリは系列フィールドを除いた最初のカテゴリ
-      const axisField = categories.find((f) => !seriesField || f.label !== seriesField.label) || categoryField;
+      const axisField = categories.find((f) => (!seriesField || f.label !== seriesField.label) && (!smField || f.label !== smField.label)) || categoryField;
       const axisColumn = resolveColumn(table, axisField.name) || categoryColumn;
       const seriesColumn = seriesField ? resolveColumn(table, seriesField.name) : null;
       const valueFields = values; // 複数measure = 複数系列
@@ -4098,8 +4263,13 @@
     const canvasWidthPx = els.reportCanvas.clientWidth || 1120;
     const fontScale = canvasWidthPx / (page.width || DEFAULT_PAGE.width);
 
-    // クロスフィルタ選択を反映するため、描画時にデータを再計算(state.crossFilterを参照)
-    const dataModel = state.project?.semantic ? buildDataModel(state.project.semantic) : null;
+    // クロスフィルタ選択を反映するため、描画時にデータを再計算(state.crossFilterを参照)。
+    // データモデルはプロジェクト単位で1度だけ構築してキャッシュ。
+    let dataModel = null;
+    if (state.project?.semantic) {
+      if (!state.project._dataModel) state.project._dataModel = buildDataModel(state.project.semantic);
+      dataModel = state.project._dataModel;
+    }
 
     for (const visual of page.visuals) {
       if (dataModel && dataModel.byName.size) visual.data = computeVisualData(visual, dataModel);
@@ -4260,7 +4430,8 @@
       const panels = data.panels.map((p) =>
         `<div class="sm-panel"><div class="sm-title">${escapeHtml(p.title)}</div>${renderDataBars({ series: p.series, max: p.max, format: p.format }, theme, false, false)}</div>`,
       ).join("");
-      return `<div class="sm-grid">${panels}</div>`;
+      const more = data.morePanels ? `<div class="sm-grid-more">他 ${data.morePanels} パネル</div>` : "";
+      return `<div class="sm-grid">${panels}</div>${more}`;
     }
 
     if (type.includes("treemap")) {
@@ -4370,7 +4541,7 @@
     if (type.includes("map")) {
       if (data?.kind === "map" && data.points.length) {
         const pts = data.points;
-        const maxV = Math.max(...pts.map((p) => p.value), 1);
+        const maxV = Math.max(...pts.map((p) => Math.abs(p.value)), 1);
         if (data.hasGeo) {
           const lats = pts.map((p) => p.lat);
           const lons = pts.map((p) => p.lon);
@@ -4381,13 +4552,13 @@
           const nx = (lo) => (maxLo === minLo ? 50 : ((lo - minLo) / (maxLo - minLo)) * 86 + 7);
           const ny = (la) => (maxLa === minLa ? 50 : (1 - (la - minLa) / (maxLa - minLa)) * 82 + 9);
           const dots = pts.map((p, i) => {
-            const r = 8 + (p.value / maxV) * 22;
+            const r = 8 + (Math.abs(p.value) / maxV) * 22;
             return `<span title="${escapeAttribute(`${p.label}: ${p.value}`)}" style="left:${nx(p.lon).toFixed(1)}%;top:${ny(p.lat).toFixed(1)}%;width:${r.toFixed(0)}px;height:${r.toFixed(0)}px;background:${escapeAttribute(theme[i % theme.length])}"></span>`;
           }).join("");
           return `<div class="mini-map">${dots}</div>`;
         }
         const bubbles = pts.slice(0, 12).map((p, i) => {
-          const r = 26 + (p.value / maxV) * 40;
+          const r = 26 + (Math.abs(p.value) / maxV) * 40;
           return `<div class="map-bubble" style="width:${r.toFixed(0)}px;height:${r.toFixed(0)}px;background:${escapeAttribute(theme[i % theme.length])}" title="${escapeAttribute(`${p.label}: ${p.value}`)}"><span>${escapeHtml(p.label)}</span></div>`;
         }).join("");
         return `<div class="mini-map-bubbles">${bubbles}</div>`;
