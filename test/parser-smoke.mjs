@@ -1098,3 +1098,25 @@ assert.equal(dxEv("連結"), "東|南", "CONCATENATEX over TOPN(2)");
 assert.equal(dxEv("R250"), 2, "RANKX of 250 desc = 2");
 
 console.log("extended DAX functions smoke test passed");
+
+// --- Phase 1: relationship-aware DAX + time intelligence ---
+{
+  const sales = { name: "Sales", columns: [{ name: "地域ID" }, { name: "金額" }], records: [{ 地域ID: 1, 金額: 100 }, { 地域ID: 2, 金額: 200 }, { 地域ID: 1, 金額: 50 }], measures: new Map() };
+  const dim = { name: "地域", columns: [{ name: "地域ID" }, { name: "地域名" }], records: [{ 地域ID: 1, 地域名: "東" }, { 地域ID: 2, 地域名: "西" }], measures: new Map() };
+  const rel = new Map([["Sales", sales], ["地域", dim]]);
+  rel.relationships = [{ fromTable: "Sales", fromColumn: "地域ID", toTable: "地域", toColumn: "地域ID", isActive: true, toCardinality: "one" }];
+  assert.equal(evaluateDax('CONCATENATEX(Sales, RELATED(地域[地域名]), ",")', sales.records, sales, rel), "東,西,東", "RELATED follows m:1");
+  assert.equal(evaluateDax('SUMX(FILTER(Sales, RELATED(地域[地域名])="東"), [金額])', sales.records, sales, rel), 150, "RELATED inside FILTER");
+  assert.equal(evaluateDax("SUMX(RELATEDTABLE(Sales), [金額])", dim.records.filter((r) => r.地域名 === "東"), dim, rel), 150, "RELATEDTABLE from dim filter context");
+  assert.equal(evaluateDax("SUMX(Sales, [金額])", dim.records, dim, rel), 350, "cross-table SUMX switches table context");
+
+  const tt = { name: "T", columns: [{ name: "日付" }, { name: "金額" }], records: [{ 日付: "2023-03-01", 金額: 100 }, { 日付: "2024-03-01", 金額: 150 }, { 日付: "2024-09-01", 金額: 70 }], measures: new Map() };
+  const tm = new Map([["T", tt]]); tm.relationships = [];
+  assert.equal(evaluateDax("SUM(T[金額])", tt.records, tt, tm), 320, "baseline SUM");
+  assert.equal(evaluateDax("TOTALYTD(SUM(T[金額]), T[日付])", tt.records, tt, tm), 220, "TOTALYTD picks current year (150+70)");
+  assert.equal(evaluateDax("CALCULATE(SUM(T[金額]), SAMEPERIODLASTYEAR(T[日付]))", tt.records, tt, tm), 100, "SAMEPERIODLASTYEAR");
+  assert.equal(evaluateDax('CALCULATE(SUM(T[金額]), DATEADD(T[日付], -1, "YEAR"))', tt.records, tt, tm), 100, "DATEADD -1 year");
+  assert.equal(evaluateDax("CALCULATE(SUM(T[金額]), REMOVEFILTERS(T))", tt.records.filter((r) => r.日付 === "2024-03-01"), tt, tm), 320, "REMOVEFILTERS restores all rows");
+}
+
+console.log("relationship + time intelligence DAX smoke test passed");
