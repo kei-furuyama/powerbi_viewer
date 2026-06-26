@@ -618,8 +618,29 @@ select {
   color: var(--muted);
   font-size: 0.72rem;
   overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
   text-overflow: ellipsis;
-  white-space: nowrap;
+}
+
+/* マルチ行カード: メジャーを縦に並べる */
+.mini-multicard {
+  display: grid;
+  gap: 6px;
+  align-content: center;
+  width: 100%;
+  height: 100%;
+  overflow: auto;
+}
+
+.mini-multicard .mini-card {
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 4px;
+}
+
+.mini-multicard .mini-card:last-child {
+  border-bottom: none;
 }
 
 .mini-slicer {

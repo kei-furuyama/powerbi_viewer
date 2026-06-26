@@ -1166,7 +1166,7 @@
     return filters;
   }
 
-  const COMPARISON_OPS = { 0: "=", 1: ">", 2: ">=", 3: "<", 4: "<=" };
+  const COMPARISON_OPS = { 0: "=", 1: ">", 2: ">=", 3: "<", 4: "<=", 5: "<>" };
 
   function collectFilterConditions(condition, negate, out) {
     if (!condition || typeof condition !== "object") return;
@@ -2578,6 +2578,7 @@
         case "<": hit = cmp < 0; break;
         case ">=": hit = cmp >= 0; break;
         case "<=": hit = cmp <= 0; break;
+        case "<>": hit = cmp !== 0; break;
         default: hit = cmp === 0;
       }
     }
@@ -2696,8 +2697,39 @@
       return { kind: "slicer", field: categoryField?.display || "", items };
     }
 
+    // マルチ行カード: 各メジャーを1行ずつ表示
+    if (type.includes("multirow")) {
+      const cards = values
+        .map((field) => {
+          const ev = evaluateField(field, records, table, model);
+          return ev ? { text: formatMeasureValue(ev.value, ev.format), label: field.display } : null;
+        })
+        .filter(Boolean);
+      if (!cards.length) return null;
+      return { kind: "multicard", cards };
+    }
+
+    // ゲージ: 値・最小・最大・目標をロール名から取得し弧を算出
+    if (type.includes("gauge")) {
+      const byRole = (re) => {
+        for (const role of visual.roles || []) {
+          if (re.test(role.role)) {
+            const ev = evaluateField(role.fields[0], records, table, model);
+            if (ev) return Number(ev.value);
+          }
+        }
+        return null;
+      };
+      const ev = valueField ? evaluateField(valueField, records, table, model) : null;
+      if (!ev) return null;
+      const value = Number(ev.value) || 0;
+      const min = byRole(/^min/i) ?? 0;
+      const max = byRole(/^(max|target)/i) ?? (value > 0 ? value : 1);
+      return { kind: "gauge", value, text: formatMeasureValue(ev.value, ev.format), label: valueField.display, min, max };
+    }
+
     // カード / KPI(カテゴリなし)
-    if ((type.includes("card") || type.includes("kpi") || type.includes("gauge") || type.includes("multirow")) || (!categoryColumn && valueField)) {
+    if ((type.includes("card") || type.includes("kpi")) || (!categoryColumn && valueField)) {
       const evaluated = valueField ? evaluateField(valueField, records, table, model) : null;
       if (!evaluated) return null;
       return { kind: "card", value: evaluated.value, text: formatMeasureValue(evaluated.value, evaluated.format), label: valueField.display };
@@ -2796,7 +2828,7 @@
       if (normalized) {
         max = 1;
       } else if (stacked) {
-        max = Math.max(1, ...categoriesList.map((_, i) => seriesList.reduce((sum, s) => sum + Math.max(0, s.values[i]), 0)));
+        max = Math.max(1, ...categoriesList.map((_, i) => seriesList.reduce((sum, s) => sum + Math.abs(s.values[i]), 0)));
       } else {
         max = Math.max(1, ...seriesList.flatMap((s) => s.values.map((v) => Math.abs(v))));
       }
@@ -3072,13 +3104,11 @@
     }
 
     if (type.includes("gauge")) {
-      const valueText = data?.kind === "card" ? data.text : "—";
-      return renderGauge(valueText, valueLabel, color);
+      const valueText = data?.kind === "gauge" ? data.text : "—";
+      return renderGauge(valueText, valueLabel, color, data?.kind === "gauge" ? data : null);
     }
 
     if (type.includes("card") || type.includes("kpi") || type.includes("multirowcard")) {
-      const valueText = data?.kind === "card" ? data.text : "—";
-      const label = (data?.kind === "card" && data.label) || valueLabel;
       const card = visual.style?.card || {};
       const valueStyle = [
         card.valueColor ? `color:${escapeAttribute(card.valueColor)}` : "",
@@ -3091,12 +3121,18 @@
         card.labelSize ? `font-size:${escapeAttribute(ptToPx(card.labelSize, fontScale))}` : "",
         card.labelAlign ? `text-align:${escapeAttribute(card.labelAlign)}` : "",
       ].filter(Boolean).join(";");
-      const valueHtml = `<div class="mini-card-value" style="${valueStyle}">${escapeHtml(valueText)}</div>`;
-      const labelHtml = card.labelShow === false
-        ? ""
-        : `<div class="mini-card-label" style="${labelStyle}">${escapeHtml(label)}</div>`;
-      const body = card.labelPosition === "below" ? `${valueHtml}${labelHtml}` : `${labelHtml}${valueHtml}`;
-      return `<div class="mini-card">${body}</div>`;
+      const cardCell = (text, label) => {
+        const valueHtml = `<div class="mini-card-value" style="${valueStyle}">${escapeHtml(text)}</div>`;
+        const labelHtml = card.labelShow === false ? "" : `<div class="mini-card-label" style="${labelStyle}">${escapeHtml(label)}</div>`;
+        return `<div class="mini-card">${card.labelPosition === "below" ? `${valueHtml}${labelHtml}` : `${labelHtml}${valueHtml}`}</div>`;
+      };
+      // マルチ行カード: 全メジャーを縦に
+      if (data?.kind === "multicard") {
+        return `<div class="mini-multicard">${data.cards.map((c) => cardCell(c.text, c.label)).join("")}</div>`;
+      }
+      const valueText = data?.kind === "card" ? data.text : "—";
+      const label = (data?.kind === "card" && data.label) || valueLabel;
+      return cardCell(valueText, label);
     }
 
     if (type.includes("combo") && data?.kind === "category") {
@@ -3244,6 +3280,7 @@
                 run.bold ? "font-weight:700" : "",
                 run.italic ? "font-style:italic" : "",
                 run.sizePt ? `font-size:${escapeAttribute(ptToPx(run.sizePt, fontScale))}` : "",
+                run.font ? `font-family:${escapeAttribute(cssFontFamily(run.font))}` : "",
               ].filter(Boolean).join(";");
               return `<span style="${styles}">${escapeHtml(run.text)}</span>`;
             })
@@ -3310,7 +3347,7 @@
     const groups = categories
       .map((label, ci) => {
         const denom = normalized
-          ? Math.max(1, seriesList.reduce((sum, ser) => sum + Math.max(0, ser.values[ci]), 0))
+          ? Math.max(1, seriesList.reduce((sum, ser) => sum + Math.abs(ser.values[ci]), 0))
           : max;
         const segs = seriesList
           .map((ser, si) => {
@@ -3366,10 +3403,8 @@
         .map((flex, index) => `<span style="flex:${flex};background:${escapeAttribute(theme[index % theme.length])}"></span>`)
         .join("")}</div>`;
     }
-    const total = series.reduce((sum, point) => sum + point.value, 0) || 1;
     const tiles = series
       .map((point, index) => {
-        const pct = (point.value / total) * 100;
         const valueText = formatMeasureValue(point.value, data.format);
         return `<span class="treemap-tile" style="flex:${point.value};background:${escapeAttribute(theme[index % theme.length])}" title="${escapeAttribute(`${point.label}: ${valueText}`)}">
           <b>${escapeHtml(point.label)}</b><i>${escapeHtml(valueText)}</i>
@@ -3396,17 +3431,34 @@
     return `<div class="mini-scatter" aria-hidden="true">${dots}</div>`;
   }
 
-  function renderGauge(valueText, label, color) {
+  function renderGauge(valueText, label, color, gauge) {
+    // 値の割合(value-min)/(max-min)を半円弧(180°)にマップ
+    let ratio = 0.6;
+    if (gauge && Number.isFinite(gauge.value)) {
+      const span = (gauge.max - gauge.min) || 1;
+      ratio = Math.max(0, Math.min(1, (gauge.value - gauge.min) / span));
+    }
+    const cx = 50, cy = 50, r = 44;
+    const angle = Math.PI - ratio * Math.PI; // 左(180°)→右(0°)
+    const ex = (cx + r * Math.cos(angle)).toFixed(2);
+    const ey = (cy - r * Math.sin(angle)).toFixed(2);
+    const largeArc = ratio > 0.5 ? 1 : 0;
+    const valuePath = ratio <= 0 ? "" : `<path d="M6 50 A${r} ${r} 0 ${largeArc} 1 ${ex} ${ey}" fill="none" stroke="${escapeAttribute(color)}" stroke-width="10" stroke-linecap="round" />`;
     return `
       <div class="mini-gauge">
         <svg viewBox="0 0 100 56" preserveAspectRatio="xMidYMid meet" aria-hidden="true">
-          <path d="M6 50 A44 44 0 0 1 94 50" fill="none" stroke="#e7e2d8" stroke-width="10" stroke-linecap="round" />
-          <path d="M6 50 A44 44 0 0 1 72 14" fill="none" stroke="${escapeAttribute(color)}" stroke-width="10" stroke-linecap="round" />
+          <path d="M6 50 A${r} ${r} 0 0 1 94 50" fill="none" stroke="#e7e2d8" stroke-width="10" stroke-linecap="round" />
+          ${valuePath}
         </svg>
         <div class="mini-gauge-value">${escapeHtml(valueText)}</div>
         <div class="mini-card-label">${escapeHtml(label)}</div>
       </div>
     `;
+  }
+
+  function cssFontFamily(name) {
+    const safe = String(name || "").replace(/[^\w \-]/g, "").trim();
+    return safe ? `'${safe}', sans-serif` : "";
   }
 
   function linePath(values, max) {
@@ -3415,6 +3467,12 @@
     const right = 116;
     const top = 8;
     const bottom = 58;
+    // 単一データ点は水平線で可視化(M...のみだと描画されない)
+    if (values.length === 1) {
+      const v = typeof values[0] === "object" && values[0] ? values[0].value : values[0];
+      const y = (bottom - Math.max(0, Math.abs(Number(v) || 0) / (max || 1)) * (bottom - top)).toFixed(1);
+      return `M${left} ${y}L${right} ${y}`;
+    }
     const step = values.length > 1 ? (right - left) / (values.length - 1) : 0;
     return values
       .map((raw, index) => {

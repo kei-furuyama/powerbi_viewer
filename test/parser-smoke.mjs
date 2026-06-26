@@ -691,6 +691,66 @@ assert.equal(mtT.totals[2], "4", "grand total count");
 
 console.log("measure-table smoke test passed");
 
+// --- 監査修正: multiRowCard全メジャー / gauge範囲 / <> 演算子 ---
+const auTmdl = [
+  "table T",
+  "\tmeasure 売上 = SUM('T'[v])",
+  "\tmeasure 利益 = SUM('T'[p])",
+  "\tmeasure 件数 = COUNTROWS('T')",
+  "\tmeasure 目標 = 100",
+  "\tcolumn k", "\t\tdataType: string",
+  "\tcolumn v", "\t\tdataType: int64",
+  "\tcolumn p", "\t\tdataType: int64",
+  "\tpartition T = m", "\t\tsource =",
+  "\t\t\tlet Source = Table.FromRows({ {\"A\",60,20},{\"B\",40,10} }, type table [k=text, v=Int64.Type, p=Int64.Type]) in Source",
+].join("\n");
+const auM = (p) => ({ field: { Measure: { Expression: { SourceRef: { Entity: "T" } }, Property: p } }, queryRef: "T." + p, nativeQueryRef: p });
+const auVis = (name, vtype, qs) => ({ path: `AU.Report/definition/pages/P/visuals/${name}/visual.json`, text: JSON.stringify({ name, position: { x: 0, y: 0, width: 300, height: 200, z: 0 }, visual: { visualType: vtype, query: { queryState: qs } } }), size: 200 });
+const auProject = analyzeProject(
+  [
+    { path: "AU.pbip", text: JSON.stringify({ version: "1.0", artifacts: [{ report: { path: "AU.Report" } }] }), size: 40 },
+    { path: "AU.Report/definition/pages/pages.json", text: JSON.stringify({ pageOrder: ["P"] }), size: 30 },
+    { path: "AU.Report/definition/pages/P/page.json", text: JSON.stringify({ name: "P", displayName: "P", width: 1280, height: 720 }), size: 60 },
+    auVis("mrc", "multiRowCard", { Values: { projections: [auM("売上"), auM("利益"), auM("件数")] } }),
+    auVis("g", "gauge", { Y: { projections: [auM("売上")] }, TargetValue: { projections: [auM("目標")] } }),
+    { path: "AU.SemanticModel/definition/tables/T.tmdl", text: auTmdl, size: 400 },
+  ],
+  [],
+);
+const mrc = auProject.report.pages[0].visuals.find((v) => v.id === "mrc").data;
+assert.equal(mrc.kind, "multicard", "multiRowCard -> multicard");
+assert.equal(mrc.cards.length, 3, "all 3 measures rendered (not just first)");
+assert.equal(mrc.cards[1].label, "利益", "second measure present");
+const gauge = auProject.report.pages[0].visuals.find((v) => v.id === "g").data;
+assert.equal(gauge.kind, "gauge", "gauge kind");
+assert.equal(gauge.value, 100, "gauge value = SUM (60+40)");
+assert.equal(gauge.max, 100, "gauge max from TargetValue role");
+
+// <> 演算子(ComparisonKind 5)のフィルタ
+const neTmdl = ["table T", "\tmeasure 件数 = COUNTROWS('T')", "\tcolumn s", "\t\tdataType: string", "\tpartition T = m", "\t\tsource =", "\t\t\tlet Source = Table.FromRows({ {\"X\"},{\"X\"},{\"Y\"} }, type table [s=text]) in Source"].join("\n");
+const neFilterConfig = {
+  filters: [{
+    name: "f",
+    field: { Column: { Expression: { SourceRef: { Entity: "T" } }, Property: "s" } },
+    filter: { Where: [{ Condition: { Comparison: { ComparisonKind: 5, Left: { Column: { Property: "s" } }, Right: { Literal: { Value: "'X'" } } } } }] },
+  }],
+};
+const neVisual = { name: "c", position: { x: 0, y: 0, width: 200, height: 120, z: 0 }, filterConfig: neFilterConfig, visual: { visualType: "cardVisual", query: { queryState: { Data: { projections: [auM("件数")] } } } } };
+const neProject = analyzeProject(
+  [
+    { path: "NE.pbip", text: JSON.stringify({ version: "1.0", artifacts: [{ report: { path: "NE.Report" } }] }), size: 40 },
+    { path: "NE.Report/definition/pages/pages.json", text: JSON.stringify({ pageOrder: ["P"] }), size: 30 },
+    { path: "NE.Report/definition/pages/P/page.json", text: JSON.stringify({ name: "P", displayName: "P", width: 1280, height: 720 }), size: 60 },
+    { path: "NE.Report/definition/pages/P/visuals/c/visual.json", text: JSON.stringify(neVisual), size: 200 },
+    { path: "NE.SemanticModel/definition/tables/T.tmdl", text: neTmdl, size: 200 },
+  ],
+  [],
+);
+// s <> "X" -> only the 1 "Y" row
+assert.equal(neProject.report.pages[0].visuals[0].data.text, "1", "<> (not equals) filter keeps only non-X rows");
+
+console.log("audit fixes smoke test passed");
+
 const legacyReportConfig = {
   name: "legacy_donut",
   layouts: [
