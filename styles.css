@@ -944,6 +944,38 @@ select {
   text-shadow: 0 1px 1px rgba(0, 0, 0, 0.35);
 }
 
+/* 小さな倍数: ミニ棒グラフのグリッド */
+.sm-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(90px, 1fr));
+  gap: 8px;
+  height: 100%;
+  align-content: start;
+  overflow: hidden;
+}
+
+.sm-panel {
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 4px 4px 2px;
+  background: var(--surface);
+  min-height: 0;
+}
+
+.sm-title {
+  font-size: 0.66rem;
+  font-weight: 600;
+  color: var(--muted);
+  margin-bottom: 2px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sm-panel .vbars {
+  height: 56px;
+}
+
 .mini-axis {
   display: flex;
   justify-content: space-between;

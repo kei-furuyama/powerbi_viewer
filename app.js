@@ -3802,6 +3802,40 @@
       return { kind: "card", value: evaluated.value, text: formatMeasureValue(evaluated.value, evaluated.format), label: valueField.display };
     }
 
+    // 小さな倍数(Small multiples): SMロールの値ごとにミニチャートへ分割
+    const smField = fieldByRole(visual, /small.?multipl/i);
+    if (smField && categoryColumn && valueField) {
+      const smCol = resolveColumn(table, smField.name);
+      const panelMap = new Map();
+      for (const rec of records) {
+        const pk = String(rec[smCol] ?? "").trim() || "(空白)";
+        if (!panelMap.has(pk)) panelMap.set(pk, []);
+        panelMap.get(pk).push(rec);
+      }
+      let globalMax = 0;
+      let fmt = "";
+      const panels = [];
+      for (const [title, recs] of panelMap) {
+        const catMap = new Map();
+        for (const rec of recs) {
+          const ck = String(rec[categoryColumn] ?? "").trim() || "(空白)";
+          if (!catMap.has(ck)) catMap.set(ck, []);
+          catMap.get(ck).push(rec);
+        }
+        const series = [...catMap.entries()].map(([label, crecs]) => {
+          const ev = evaluateField(valueField, crecs, table, model);
+          if (ev && !fmt) fmt = ev.format;
+          const value = ev ? Number(ev.value) || 0 : 0;
+          globalMax = Math.max(globalMax, Math.abs(value));
+          return { label, value };
+        });
+        panels.push({ title, series });
+      }
+      if (panels.length > 1) {
+        return { kind: "smallMultiples", panels: panels.slice(0, 9).map((p) => ({ ...p, max: globalMax || 1, format: fmt })) };
+      }
+    }
+
     // カテゴリ系チャート(複数系列対応)
     if (categoryColumn && valueField) {
       const seriesField = seriesFieldOf(visual, null);
@@ -4220,6 +4254,14 @@
     }
 
     const data = visual.data;
+
+    // 小さな倍数: パネルごとにミニ棒グラフのグリッド
+    if (data?.kind === "smallMultiples") {
+      const panels = data.panels.map((p) =>
+        `<div class="sm-panel"><div class="sm-title">${escapeHtml(p.title)}</div>${renderDataBars({ series: p.series, max: p.max, format: p.format }, theme, false, false)}</div>`,
+      ).join("");
+      return `<div class="sm-grid">${panels}</div>`;
+    }
 
     if (type.includes("treemap")) {
       return renderTreemap(data, theme, categoryLabel, valueLabel);
