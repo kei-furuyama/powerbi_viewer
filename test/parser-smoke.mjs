@@ -581,6 +581,28 @@ assert.equal(tv.data.totals[1], "60", "sum of v column (10+20+30)");
 
 console.log("table format smoke test passed");
 
+// --- 画像(A): 解決とページ背景 ---
+const imgProject = analyzeProject(
+  [
+    { path: "IMG.pbip", text: JSON.stringify({ version: "1.0", artifacts: [{ report: { path: "IMG.Report" } }] }), size: 40 },
+    { path: "IMG.Report/definition/report.json", text: JSON.stringify({ resourcePackages: [{ name: "RegisteredResources", items: [{ name: "logo.svg", path: "logo.svg" }] }] }), size: 80 },
+    { path: "IMG.Report/definition/pages/pages.json", text: JSON.stringify({ pageOrder: ["P"] }), size: 30 },
+    { path: "IMG.Report/definition/pages/P/page.json", text: JSON.stringify({ name: "P", displayName: "P", width: 1280, height: 720, objects: { background: [{ properties: { image: { image: { name: { expr: { Literal: { Value: "'bg.svg'" } } }, scaling: { expr: { Literal: { Value: "'Fill'" } } } } } } }] } }), size: 120 },
+    { path: "IMG.Report/definition/pages/P/visuals/logo/visual.json", text: JSON.stringify({ name: "logo", position: { x: 0, y: 0, width: 200, height: 120, z: 0 }, visual: { visualType: "image", objects: { general: [{ properties: { imageUrl: { expr: { ResourcePackageItem: { ItemName: "logo.svg" } } } } }] } } }), size: 120 },
+    { path: "IMG.Report/StaticResources/RegisteredResources/logo.svg", text: "", isImage: true, dataUrl: "data:image/svg+xml;base64,AAA", size: 100 },
+    { path: "IMG.Report/StaticResources/RegisteredResources/bg.svg", text: "", isImage: true, dataUrl: "data:image/svg+xml;base64,BBB", size: 100 },
+  ],
+  [],
+);
+const logoVisual = imgProject.report.pages[0].visuals.find((v) => v.id === "logo");
+assert.equal(logoVisual.imageRef.name, "logo.svg", "image resource name extracted");
+assert.equal(logoVisual.imageData, "data:image/svg+xml;base64,AAA", "image visual resolved to data URL");
+assert.equal(imgProject.report.pages[0].background.image.name, "bg.svg", "page background image name");
+assert.equal(imgProject.report.pages[0].background.image.scaling, "cover", "Fill -> cover");
+assert.equal(imgProject.report.pages[0].background.imageData, "data:image/svg+xml;base64,BBB", "page background resolved");
+
+console.log("image smoke test passed");
+
 const legacyReportConfig = {
   name: "legacy_donut",
   layouts: [

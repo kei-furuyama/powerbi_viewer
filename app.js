@@ -1,5 +1,6 @@
 (() => {
   const TEXT_LIMIT = 8 * 1024 * 1024;
+  const IMAGE_LIMIT = 12 * 1024 * 1024;
   const DEFAULT_PAGE = { width: 1280, height: 720 };
   const state = {
     project: null,
@@ -168,6 +169,15 @@
         continue;
       }
 
+      if (isImagePath(path)) {
+        if (file.size > IMAGE_LIMIT) {
+          issues.push({ level: "warning", title: "大きすぎる画像をスキップしました", detail: `${path} (${formatBytes(file.size)})` });
+          continue;
+        }
+        entries.push({ path, text: "", dataUrl: await readDataUrl(file), isImage: true, size: file.size, source: file.name });
+        continue;
+      }
+
       if (!isTextPath(path)) {
         issues.push({
           level: "info",
@@ -206,11 +216,25 @@
       const path = normalizePath(rawPath);
       if (entry.dir) return;
 
+      const size = entry._data?.uncompressedSize || 0;
+
+      if (isImagePath(path)) {
+        if (size > IMAGE_LIMIT) {
+          issues.push({ level: "warning", title: "zip内の大きすぎる画像をスキップしました", detail: `${path} (${formatBytes(size)})` });
+          return;
+        }
+        tasks.push(
+          entry.async("base64").then((base64) => {
+            result.push({ path, text: "", dataUrl: `data:${imageMime(path)};base64,${base64}`, isImage: true, size, source: file.name });
+          }),
+        );
+        return;
+      }
+
       if (!isTextPath(path)) {
         return;
       }
 
-      const size = entry._data?.uncompressedSize || 0;
       if (size > TEXT_LIMIT) {
         issues.push({
           level: "warning",
@@ -269,6 +293,7 @@
     const semantic = buildSemantic(normalizedEntries, jsonByPath);
     const dataModel = buildDataModel(semantic);
     hydrateVisualData(report, dataModel);
+    resolveImages(report, normalizedEntries, issues);
     const measureUsage = computeMeasureUsage(report, semantic);
     const validation = validateProject(normalizedEntries, report, semantic, jsonByPath);
     const pbipFiles = normalizedEntries.filter((entry) => entry.path.toLowerCase().endsWith(".pbip"));
@@ -536,7 +561,17 @@
       color: readExprColor(bgProps?.color),
       transparency: readExprNumber(bgProps?.transparency),
       outspaceColor: readExprColor(outProps?.color),
+      image: extractBackgroundImage(bgProps) || extractBackgroundImage(outProps),
+      imageData: null,
     };
+  }
+
+  function extractBackgroundImage(props) {
+    const img = props?.image?.image || props?.image;
+    if (!img || typeof img !== "object") return null;
+    const name = resourceItemName(img.name) || readExprString(img.name) || (typeof img.name === "string" ? img.name : "");
+    if (!name) return null;
+    return { name, scaling: cssObjectFit(readExprString(img.scaling) || img.scaling) };
   }
 
   function extractLegacyPage(section, reportPath, index) {
@@ -632,6 +667,7 @@
     const textContent = extractRichText(visualObject, visualRoot);
     const paragraphs = extractTextParagraphs(visualObject, visualRoot);
     const filters = extractVisualFilters(visualRoot, visualObject);
+    const imageRef = type.includes("image") ? extractImageRef(visualObject, visualRoot) : null;
     const explicitTitle = style.title.text || extractTitle(visualRoot);
     const title = explicitTitle || textContent || typeLabel(type);
 
@@ -650,6 +686,8 @@
       textContent,
       paragraphs,
       filters,
+      imageRef,
+      imageData: null,
       filterCount: countKeyMatches(visualRoot, /filter/i),
       hasQuery: Boolean(visualObject.query || visualRoot.query || visualObject.prototypeQuery),
       jsonStatus: json ? "parsed" : "missing",
@@ -1060,6 +1098,40 @@
     if (value == null) return null;
     const number = Number(String(value).replace(/[^\d.]/g, ""));
     return Number.isFinite(number) && number > 0 ? number : null;
+  }
+
+  // 画像ビジュアルの参照(登録リソース名 or 直接URL)とスケーリングを抽出
+  function extractImageRef(visualObject, visualRoot) {
+    const objects = visualObject?.objects || visualRoot?.objects || {};
+    const general = firstObjectProps(objects.general);
+    const imageProps = firstObjectProps(objects.image);
+
+    const resourceName =
+      resourceItemName(general?.imageUrl) ||
+      resourceItemName(imageProps?.imageUrl) ||
+      readExprString(general?.imageUrl) ||
+      "";
+    const url = readExprString(imageProps?.sourceUrl) || readExprString(imageProps?.url) || readExprString(general?.url);
+    const scaling = cssObjectFit(
+      readExprString(general?.imageScalingType) || readExprString(imageProps?.imageScalingType) || readExprString(general?.scaling),
+    );
+
+    if (!resourceName && !url) return null;
+    return { name: resourceName, url, scaling };
+  }
+
+  function resourceItemName(prop) {
+    if (!prop || typeof prop !== "object") return "";
+    const expr = prop.expr || prop;
+    return expr?.ResourcePackageItem?.ItemName || expr?.ImageValue?.Url || "";
+  }
+
+  function cssObjectFit(scaling) {
+    const text = String(scaling || "").toLowerCase();
+    if (text.includes("fill")) return "cover";
+    if (text.includes("fit")) return "contain";
+    if (text.includes("stretch") || text.includes("normal")) return "fill";
+    return "contain";
   }
 
   function cssAlignName(value) {
@@ -2110,6 +2182,54 @@
     return `${sign}${digits}${decPart != null ? `.${decPart}` : ""}`;
   }
 
+  // --- 画像リソースの解決(登録名/パス → data URL) --------------------
+
+  function resolveImages(report, entries, issues) {
+    const index = new Map();
+    for (const entry of entries) {
+      if (!entry.isImage || !entry.dataUrl) continue;
+      const base = basename(entry.path).toLowerCase();
+      index.set(base, entry.dataUrl);
+      index.set(normalizeName(base), entry.dataUrl);
+      index.set(entry.path.toLowerCase(), entry.dataUrl);
+    }
+
+    const resolve = (name) => {
+      if (!name) return "";
+      const base = basename(name).toLowerCase();
+      return index.get(base) || index.get(normalizeName(base)) || index.get(name.toLowerCase()) || "";
+    };
+
+    let missing = 0;
+    for (const visual of report.visuals) {
+      if (!visual.imageRef) continue;
+      if (visual.imageRef.url && /^https?:\/\//i.test(visual.imageRef.url)) {
+        visual.imageData = visual.imageRef.url;
+      } else {
+        visual.imageData = resolve(visual.imageRef.name);
+        if (!visual.imageData && visual.imageRef.name) missing += 1;
+      }
+    }
+    // report.visualsはpage.visualsのコピーなので、page側にも反映
+    const dataById = new Map(report.visuals.map((v) => [`${v.pageId}/${v.id}`, v.imageData]));
+    for (const page of report.pages) {
+      for (const visual of page.visuals) {
+        if (visual.imageRef) visual.imageData = dataById.get(`${page.id}/${visual.id}`) || "";
+      }
+      if (page.background?.image?.name) {
+        page.background.imageData = resolve(page.background.image.name);
+      }
+    }
+
+    if (missing > 0) {
+      issues.push({
+        level: "warning",
+        title: `画像リソースが見つかりません (${missing}件)`,
+        detail: "ビジュアルが参照する画像が StaticResources/RegisteredResources に見つかりませんでした。フォルダごと読み込むと解決できます。",
+      });
+    }
+  }
+
   // --- PBIP整合性チェック(壊れていないかの検査) ----------------------
 
   function validateProject(entries, report, semantic, jsonByPath) {
@@ -2649,6 +2769,16 @@
     els.reportCanvas.style.aspectRatio = `${page.width} / ${page.height}`;
     els.reportCanvas.style.background = page.background?.color || "";
     els.reportCanvas.style.color = state.project?.report?.theme?.foreground || "";
+    // ページ背景画像/壁紙
+    if (page.background?.imageData) {
+      const size = page.background.image?.scaling === "cover" ? "cover" : page.background.image?.scaling === "fill" ? "100% 100%" : "contain";
+      els.reportCanvas.style.backgroundImage = `url("${page.background.imageData}")`;
+      els.reportCanvas.style.backgroundSize = size;
+      els.reportCanvas.style.backgroundPosition = "center";
+      els.reportCanvas.style.backgroundRepeat = "no-repeat";
+    } else {
+      els.reportCanvas.style.backgroundImage = "";
+    }
 
     const theme = getTheme();
     // キャンバスの実描画幅から論理座標→ピクセルのスケールを算出(ズーム追従・全ブラウザ対応)
@@ -2740,6 +2870,10 @@
     }
 
     if (type.includes("image")) {
+      if (visual.imageData) {
+        const fit = visual.imageRef?.scaling || "contain";
+        return `<img class="mini-image-img" src="${escapeAttribute(visual.imageData)}" alt="${escapeHtml(visual.title || "image")}" style="object-fit:${escapeAttribute(fit)}" />`;
+      }
       return `<div class="mini-image" aria-hidden="true"></div>`;
     }
 
@@ -3397,6 +3531,7 @@
     if (lower.endsWith(".bim")) return "BIM";
     if (lower.endsWith(".tmdl")) return "TMDL";
     if (lower.endsWith(".platform")) return "Platform";
+    if (isImagePath(lower)) return "Image";
     if (lower.endsWith("/page.json")) return "Page";
     if (lower.endsWith("/visual.json")) return "Visual";
     if (lower.endsWith("/report.json")) return "Report";
@@ -3430,12 +3565,32 @@
     );
   }
 
+  function isImagePath(path) {
+    return /\.(png|jpe?g|gif|svg|webp|bmp)$/i.test(path);
+  }
+
+  function imageMime(path) {
+    const ext = (path.toLowerCase().match(/\.([a-z0-9]+)$/) || [])[1];
+    if (ext === "jpg" || ext === "jpeg") return "image/jpeg";
+    if (ext === "svg") return "image/svg+xml";
+    return `image/${ext || "png"}`;
+  }
+
   function readText(file) {
     return new Promise((resolve, reject) => {
       const reader = new FileReader();
       reader.onload = () => resolve(String(reader.result || ""));
       reader.onerror = () => reject(reader.error || new Error(`Cannot read ${file.name}`));
       reader.readAsText(file);
+    });
+  }
+
+  function readDataUrl(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result || ""));
+      reader.onerror = () => reject(reader.error || new Error(`Cannot read ${file.name}`));
+      reader.readAsDataURL(file);
     });
   }
 
