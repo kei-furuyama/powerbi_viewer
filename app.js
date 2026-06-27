@@ -5391,7 +5391,7 @@
           <article class="model-table">
             <div class="model-head">
               <h3>${escapeHtml(table.name)}</h3>
-              <span class="model-count">${table.columns.length} columns / ${table.measures.length} measures${unusedCount ? ` · <span class="count-warn">未使用M ${unusedCount}</span>` : ""}${unusedColCount ? ` · <span class="count-warn">未使用C ${unusedColCount}</span>` : ""}</span>
+              <span class="model-count">列 ${table.columns.length} / メジャー ${table.measures.length}${unusedCount ? ` · <span class="count-warn">未使用メジャー ${unusedCount}</span>` : ""}${unusedColCount ? ` · <span class="count-warn">未使用列 ${unusedColCount}</span>` : ""}</span>
             </div>
             ${showMeasures.length ? `<div class="panel-title">メジャー (DAX)</div><div class="measure-list">${measureRows}</div>` : ""}
             ${showColumns.length ? `<div class="panel-title">列</div><div class="field-list">${columnRows}</div>` : (table.columns.length ? "" : '<span class="muted">列を検出できませんでした</span>')}
